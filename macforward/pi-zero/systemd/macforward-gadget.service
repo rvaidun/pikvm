@@ -1,0 +1,13 @@
+[Unit]
+Description=briKVM MacForward: create UVC+UAC2 USB gadget
+After=sys-kernel-config.mount
+Before=macforward-uvc.service macforward-receiver.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/macforward/setup-gadget.sh
+ExecStop=/bin/sh -c 'echo "" > /sys/kernel/config/usb_gadget/macforward/UDC || true'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=briKVM MacForward: uvc-gadget daemon (loopback -> USB UVC)
+After=macforward-gadget.service
+Requires=macforward-gadget.service
+
+[Service]
+Type=simple
+ExecStart=/opt/macforward/uvc-handler.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+# Let the kvm-bridge service (running as 'rahul') write HID reports to the
+# gadget endpoints without root. The hidg devices are created by the kernel
+# when the UDC is bound; this rule fires on their appearance.
+KERNEL=="hidg[0-9]*", SUBSYSTEM=="hidg", MODE="0660", GROUP="input"

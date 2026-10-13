@@ -1,0 +1,4 @@
+# Append these lines to /boot/firmware/config.txt
+# Enables USB OTG (device mode) on the Pi Zero's data USB port.
+
+dtoverlay=dwc2

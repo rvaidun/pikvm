@@ -1,0 +1,23 @@
+[Unit]
+Description=briKVM web bridge (WS -> /dev/hidg*)
+After=network-online.target kvm-gadget.service
+Wants=network-online.target
+Requires=kvm-gadget.service
+# Don't start until the gadget has actually created the endpoints.
+ConditionPathExists=/dev/hidg0
+ConditionPathExists=/dev/hidg1
+
+[Service]
+Type=simple
+Environment=HIDG_KBD=/dev/hidg0
+Environment=HIDG_MOUSE=/dev/hidg1
+Environment=LISTEN=0.0.0.0:8082
+ExecStart=/usr/bin/python3 /opt/kvm/bridge.py
+WorkingDirectory=/opt/kvm
+Restart=on-failure
+RestartSec=2
+User=rahul
+SupplementaryGroups=input
+
+[Install]
+WantedBy=multi-user.target

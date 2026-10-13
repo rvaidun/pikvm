@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>briKVM</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; background: #0a0a0a; color: #ddd;
+    font: 13px/1.4 -apple-system, system-ui, sans-serif; height: 100%; overflow: hidden; }
+  #bar { display: flex; align-items: center; gap: 12px; padding: 6px 10px;
+    background: #111; border-bottom: 1px solid #222; }
+  #bar .label { color: #888; }
+  #status { padding: 2px 8px; border-radius: 3px; background: #222; color: #ccc; }
+  #status.ok { background: #0a3a1a; color: #6fe09a; }
+  #status.err { background: #3a0a0a; color: #ff8080; }
+  button { background: #222; color: #ddd; border: 1px solid #333; padding: 4px 10px;
+    border-radius: 3px; cursor: pointer; font: inherit; }
+  button:hover { background: #2a2a2a; }
+  #stage { position: relative; width: 100vw; height: calc(100vh - 36px);
+    display: flex; align-items: center; justify-content: center; background: #000; }
+  #video { max-width: 100%; max-height: 100%; display: block;
+    image-rendering: -webkit-optimize-contrast; cursor: crosshair; }
+  #capture { position: absolute; inset: 0; cursor: crosshair; }
+  #hint { position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.75); padding: 6px 12px; border-radius: 4px;
+    pointer-events: none; opacity: 0; transition: opacity 0.2s; font-size: 12px; }
+  #hint.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <strong>briKVM</strong>
+    <span id="status">connecting…</span>
+    <span class="label">·</span>
+    <span class="label">click video to capture input · Right ⌘ or Esc to release</span>
+    <span style="flex:1"></span>
+    <button id="ctrlAltDel">Ctrl+Alt+Del</button>
+  </div>
+  <div id="stage">
+    <img id="video" alt="screen">
+    <div id="capture"></div>
+    <div id="hint">input captured — press Esc to release</div>
+  </div>
+
+<script>
+// Browser event.code -> USB HID usage ID
+const HID = {
+  KeyA:4,KeyB:5,KeyC:6,KeyD:7,KeyE:8,KeyF:9,KeyG:10,KeyH:11,KeyI:12,KeyJ:13,
+  KeyK:14,KeyL:15,KeyM:16,KeyN:17,KeyO:18,KeyP:19,KeyQ:20,KeyR:21,KeyS:22,KeyT:23,
+  KeyU:24,KeyV:25,KeyW:26,KeyX:27,KeyY:28,KeyZ:29,
+  Digit1:30,Digit2:31,Digit3:32,Digit4:33,Digit5:34,
+  Digit6:35,Digit7:36,Digit8:37,Digit9:38,Digit0:39,
+  Enter:40,Escape:41,Backspace:42,Tab:43,Space:44,
+  Minus:45,Equal:46,BracketLeft:47,BracketRight:48,Backslash:49,
+  Semicolon:51,Quote:52,Backquote:53,Comma:54,Period:55,Slash:56,
+  CapsLock:57,
+  F1:58,F2:59,F3:60,F4:61,F5:62,F6:63,F7:64,F8:65,F9:66,F10:67,F11:68,F12:69,
+  PrintScreen:70,ScrollLock:71,Pause:72,
+  Insert:73,Home:74,PageUp:75,Delete:76,End:77,PageDown:78,
+  ArrowRight:79,ArrowLeft:80,ArrowDown:81,ArrowUp:82,
+  NumLock:83,NumpadDivide:84,NumpadMultiply:85,NumpadSubtract:86,NumpadAdd:87,NumpadEnter:88,
+  Numpad1:89,Numpad2:90,Numpad3:91,Numpad4:92,Numpad5:93,
+  Numpad6:94,Numpad7:95,Numpad8:96,Numpad9:97,Numpad0:98,NumpadDecimal:99,
+  ControlLeft:224,ShiftLeft:225,AltLeft:226,MetaLeft:227,
+  ControlRight:228,ShiftRight:229,AltRight:230,MetaRight:231,
+};
+
+const video = document.getElementById('video');
+const capture = document.getElementById('capture');
+const statusEl = document.getElementById('status');
+const hint = document.getElementById('hint');
+
+// Point <img> at ustreamer on same host (port 8080).
+video.src = `http://${location.hostname}:8080/stream`;
+
+// --- WebSocket ---
+let ws = null;
+function setStatus(txt, cls) {
+  statusEl.textContent = txt;
+  statusEl.className = cls || '';
+}
+function connect() {
+  const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+  ws = new WebSocket(url);
+  ws.onopen  = () => setStatus('connected', 'ok');
+  ws.onclose = () => { setStatus('disconnected — reconnecting', 'err'); setTimeout(connect, 1000); };
+  ws.onerror = () => setStatus('error', 'err');
+}
+function send(line) { if (ws && ws.readyState === 1) ws.send(line); }
+connect();
+
+// --- Pointer lock ---
+let locked = false;
+capture.addEventListener('click', () => {
+  if (!locked) capture.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  locked = (document.pointerLockElement === capture);
+  hint.classList.toggle('show', locked);
+});
+
+// --- Keyboard ---
+function onKey(e, down) {
+  if (!locked) return;
+  // Right Command on Mac = escape hatch; swallow it, release pointer lock.
+  if (e.code === 'MetaRight') {
+    e.preventDefault();
+    if (down) document.exitPointerLock();
+    return;
+  }
+  const code = HID[e.code];
+  if (code == null) return;
+  e.preventDefault();
+  send(`${down ? 'kd' : 'ku'} ${code}`);
+}
+window.addEventListener('keydown', e => onKey(e, true));
+window.addEventListener('keyup',   e => onKey(e, false));
+
+// Browser steals Esc to unlock pointer; also release all keys on unlock.
+document.addEventListener('pointerlockchange', () => { if (!locked) send('krel'); });
+
+// --- Mouse ---
+const BTN = { 0: 1, 1: 4, 2: 2 };  // browser.button -> HID button bit
+
+// Browser fires 200-500 mousemove events/sec; coalesce at animation frame
+// rate (~60Hz) and split large deltas into int8 chunks.
+let mdx = 0, mdy = 0, flushQueued = false;
+function flushMouse() {
+  flushQueued = false;
+  while (mdx !== 0 || mdy !== 0) {
+    const dx = Math.max(-127, Math.min(127, mdx));
+    const dy = Math.max(-127, Math.min(127, mdy));
+    send(`mm ${dx} ${dy}`);
+    mdx -= dx; mdy -= dy;
+  }
+}
+capture.addEventListener('mousemove', e => {
+  if (!locked) return;
+  mdx += (e.movementX | 0);
+  mdy += (e.movementY | 0);
+  if (!flushQueued) { flushQueued = true; requestAnimationFrame(flushMouse); }
+});
+capture.addEventListener('mousedown', e => {
+  if (!locked) return;
+  e.preventDefault();
+  const b = BTN[e.button]; if (b) send(`md ${b}`);
+});
+capture.addEventListener('mouseup', e => {
+  if (!locked) return;
+  e.preventDefault();
+  const b = BTN[e.button]; if (b) send(`mu ${b}`);
+});
+capture.addEventListener('contextmenu', e => e.preventDefault());
+capture.addEventListener('wheel', e => {
+  if (!locked) return;
+  e.preventDefault();
+  const d = Math.max(-127, Math.min(127, -Math.sign(e.deltaY) * Math.max(1, Math.abs(e.deltaY / 100 | 0))));
+  if (d) send(`mw ${d}`);
+}, { passive: false });
+
+// --- Ctrl+Alt+Del button ---
+document.getElementById('ctrlAltDel').addEventListener('click', () => {
+  send(`kd ${HID.ControlLeft}`);
+  send(`kd ${HID.AltLeft}`);
+  send(`kd ${HID.Delete}`);
+  setTimeout(() => { send(`ku ${HID.Delete}`); send(`ku ${HID.AltLeft}`); send(`ku ${HID.ControlLeft}`); }, 60);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+[Unit]
+Description=briKVM MacForward: ffmpeg receiver (UDP -> loopback + ALSA)
+After=macforward-gadget.service macforward-uvc.service
+Requires=macforward-gadget.service
+
+[Service]
+Type=simple
+ExecStart=/opt/macforward/receiver.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

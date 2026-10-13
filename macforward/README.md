@@ -1,0 +1,69 @@
+# briKVM MacForward
+
+Forward the Mac's webcam + microphone to a Windows PC via a Raspberry Pi Zero 2 W
+acting as a USB gadget. Windows sees a plug-and-play **USB Camera** + **USB
+Microphone** with no drivers.
+
+```
+Mac (webcam + mic)
+   │  H.264/AAC MPEG-TS over UDP
+   ▼
+Pi Zero 2 W
+   ├─ ffmpeg: UDP → v4l2loopback /dev/video10 (video) + ALSA UAC2Gadget (audio)
+   └─ uvc-gadget: /dev/video10 → UVC function → USB
+   │  USB-C data cable (Pi Zero's "USB" port, NOT "PWR IN")
+   ▼
+Windows PC
+   └─ sees "briKVM MacForward" camera + microphone
+```
+
+## Hardware
+
+- **Pi Zero 2 W** (the W or 2 W, not plain Zero — ARMv6 is too weak for 720p)
+- **Micro-USB cable, data-capable** connecting Pi Zero's `USB` port to a Windows USB port
+- **Separate power** for the Pi Zero (either via `PWR IN` micro-USB from a wall adapter, or via GPIO 5V/GND if you prefer)
+
+## Setup (one time)
+
+### On the Pi Zero
+1. Flash Raspberry Pi OS Lite (64-bit, Bookworm or newer) to an SD card
+2. Boot, SSH in, clone this repo
+3. `cd pikvm/macforward/pi-zero && sudo bash install.sh`
+4. `sudo reboot`
+5. Plug the Pi Zero's `USB` micro-USB (not `PWR IN`) into the Windows target
+6. Windows should enumerate "briKVM MacForward" camera + mic
+
+### On the Mac
+Nothing to install — ffmpeg is the only dep. If you don't have it: `brew install ffmpeg`.
+
+## Daily use
+
+```
+cd ~/GitProjects/pikvm/macforward/mac
+./forward.sh pizero.local         # or ./forward.sh 192.168.1.XX
+```
+
+Press Ctrl-C to stop streaming.
+
+Env knobs:
+- `WIDTH=640 HEIGHT=480 FPS=15 ./forward.sh pizero.local` — lower quality
+- `VBITRATE=8M ./forward.sh pizero.local` — crank video bitrate
+- `VIDEO_IDX=0 ./forward.sh pizero.local` — use a different AVFoundation camera
+
+To list cameras + mics on the Mac:
+```
+ffmpeg -f avfoundation -list_devices true -i ""
+```
+
+## Troubleshooting
+
+- **Windows doesn't see the camera**: check `dmesg | grep dwc2` on the Pi — if it says "mode: host", the OTG overlay isn't active. Confirm `dtoverlay=dwc2` is in `/boot/firmware/config.txt` and reboot.
+- **Camera appears but no video**: Pi receiver may not be getting the stream. `sudo journalctl -fu macforward-receiver` while running the Mac forwarder.
+- **Audio but no video (or vice versa)**: check `v4l2-ctl --list-devices` on the Pi for `/dev/video10` and `arecord -L` for `UAC2Gadget`.
+- **Latency too high**: drop FPS/resolution on the Mac side; a few seconds of latency is normal with UDP MPEG-TS buffering.
+
+## Known limitations (v1)
+
+- No encryption on the Mac→Pi UDP hop. Only use on trusted LANs.
+- Only 1 resolution advertised to Windows (1280x720 @ 30fps). Add more frames to `setup-gadget.sh` if needed.
+- Mac must be running the forwarder script continuously; no auto-reconnect in UI.
