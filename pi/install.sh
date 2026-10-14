@@ -10,9 +10,11 @@
 # What it does:
 #   1. Enables the dwc2 USB OTG controller in peripheral mode.
 #   2. Autoloads dwc2 + libcomposite at boot.
-#   3. Copies bridge.py + setup-gadget.sh to /opt/kvm/.
-#   4. Installs the udev rule, both systemd units, and enables them.
-#   5. Installs aiohttp + pyserial deps (apt pkg).
+#   3. Installs ffmpeg + v4l2loopback + build deps.
+#   4. Builds and installs uvc-gadget from freedesktop.org.
+#   5. Copies bridge.py, setup-gadget.sh, receiver.sh, uvc-handler.sh to /opt/kvm/.
+#   6. Installs udev rule and all four systemd units, enables them.
+#   7. Installs aiohttp (apt pkg) for the WebSocket bridge.
 
 set -euo pipefail
 
@@ -43,41 +45,78 @@ dwc2
 libcomposite
 EOF
 
-# --- 3. Deploy code ----------------------------------------------------------
+# --- 3. apt deps (ffmpeg, v4l2loopback, build tooling for uvc-gadget) -------
+apt-get update
+apt-get install -y \
+  python3-aiohttp \
+  ffmpeg \
+  v4l-utils v4l2loopback-dkms \
+  libasound2-dev \
+  build-essential git pkg-config meson ninja-build
+
+# --- 4. Build uvc-gadget from source (not packaged in Debian) ---------------
+if [ ! -x /usr/local/bin/uvc-gadget ]; then
+  TMPDIR=$(mktemp -d)
+  trap "rm -rf $TMPDIR" EXIT
+  git clone --depth 1 https://gitlab.freedesktop.org/camera/uvc-gadget.git "$TMPDIR/uvc-gadget"
+  cd "$TMPDIR/uvc-gadget"
+  meson setup build
+  meson compile -C build
+  install -m 0755 build/uvc-gadget /usr/local/bin/uvc-gadget
+  cd - >/dev/null
+fi
+echo "uvc-gadget: $(/usr/local/bin/uvc-gadget --version 2>/dev/null || echo installed)"
+
+# --- 5. Deploy code ---------------------------------------------------------
 install -d -o root -g root -m 0755 /opt/kvm
 install -o root -g root -m 0755 "$SRC_DIR/setup-gadget.sh" /opt/kvm/setup-gadget.sh
-install -o root -g root -m 0755 "$SRC_DIR/bridge.py"        /opt/kvm/bridge.py
+install -o root -g root -m 0755 "$SRC_DIR/bridge.py"       /opt/kvm/bridge.py
+install -o root -g root -m 0755 "$SRC_DIR/receiver.sh"     /opt/kvm/receiver.sh
+install -o root -g root -m 0755 "$SRC_DIR/uvc-handler.sh"  /opt/kvm/uvc-handler.sh
 install -d -o root -g root -m 0755 /opt/kvm/static
 install -o root -g root -m 0644 "$SRC_DIR/static/index.html" /opt/kvm/static/index.html
 
 # Optional override file for VID/PID/strings.
 if [ ! -f /etc/kvm-gadget.env ]; then
   cat > /etc/kvm-gadget.env <<'EOF'
-# Override the spoofed USB identity. Leave commented to use the default
-# Logitech USB Receiver (046D:C534).
-# VENDOR_ID=0x413C
-# PRODUCT_ID=0x2113
-# MANUFACTURER=Dell
-# PRODUCT=Dell USB Entry Keyboard
+# Override the spoofed USB identity. Default is Logitech MeetUp
+# (046D:086B) — a real conferencing device with camera + mic + HID remote.
+# Alternatives:
+#   VENDOR_ID=0x046D
+#   PRODUCT_ID=0x0A87
+#   MANUFACTURER=Logitech
+#   PRODUCT=GROUP Video Conferencing
 EOF
 fi
 
-# --- 4. udev + systemd -------------------------------------------------------
+if [ ! -f /etc/kvm-receiver.env ]; then
+  cat > /etc/kvm-receiver.env <<'EOF'
+# Override the Mac->Pi stream parameters. Must match the Mac's forward.sh.
+# PORT=1234
+# WIDTH=1280
+# HEIGHT=720
+# FPS=30
+EOF
+fi
+
+# --- 6. udev + systemd ------------------------------------------------------
 install -o root -g root -m 0644 "$SRC_DIR/99-kvm-hidg.rules" /etc/udev/rules.d/99-kvm-hidg.rules
 udevadm control --reload-rules
 
-install -o root -g root -m 0644 "$SRC_DIR/kvm-gadget.service" /etc/systemd/system/kvm-gadget.service
-install -o root -g root -m 0644 "$SRC_DIR/kvm-bridge.service" /etc/systemd/system/kvm-bridge.service
+install -o root -g root -m 0644 "$SRC_DIR/kvm-gadget.service"   /etc/systemd/system/kvm-gadget.service
+install -o root -g root -m 0644 "$SRC_DIR/kvm-bridge.service"   /etc/systemd/system/kvm-bridge.service
+install -o root -g root -m 0644 "$SRC_DIR/kvm-uvc.service"      /etc/systemd/system/kvm-uvc.service
+install -o root -g root -m 0644 "$SRC_DIR/kvm-receiver.service" /etc/systemd/system/kvm-receiver.service
 
 # Patch the bridge service to use whichever user is installing (default rahul).
 sed -i "s/^User=.*/User=${BRIDGE_USER}/" /etc/systemd/system/kvm-bridge.service
 
 systemctl daemon-reload
-systemctl enable kvm-gadget.service kvm-bridge.service
-
-# --- 5. Python deps ----------------------------------------------------------
-apt-get update
-apt-get install -y python3-aiohttp
+systemctl enable \
+  kvm-gadget.service \
+  kvm-bridge.service \
+  kvm-uvc.service \
+  kvm-receiver.service
 
 cat <<EOF
 
@@ -86,9 +125,14 @@ Install complete. Reboot to pick up the dwc2 overlay:
   sudo reboot
 
 After reboot, verify:
-  ls -l /dev/hidg0 /dev/hidg1
-  systemctl status kvm-gadget kvm-bridge
+  ls -l /dev/hidg0 /dev/hidg1 /dev/video0 /dev/video10
+  aplay -L | grep UAC2Gadget
+  systemctl status kvm-gadget kvm-bridge kvm-uvc kvm-receiver
   journalctl -fu kvm-bridge
 
-Then open http://<pi-ip>:8082/ in a browser and click the video.
+Then:
+  1. Open http://<pi-ip>:8082/ in a browser and click the video.
+  2. From the Mac, point the forwarder at this Pi:
+       cd .../pikvm/macforward/mac && ./forward.sh <pi-ip>
+     Windows should enumerate a camera + microphone on the composite device.
 EOF

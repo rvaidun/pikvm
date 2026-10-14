@@ -1,0 +1,16 @@
+[Unit]
+Description=briKVM receiver (Mac UDP -> v4l2loopback + ALSA UAC2Gadget)
+After=kvm-gadget.service kvm-uvc.service network-online.target
+Requires=kvm-gadget.service
+Wants=network-online.target
+ConditionPathExists=/dev/video10
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/kvm-receiver.env
+ExecStart=/opt/kvm/receiver.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

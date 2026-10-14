@@ -32,7 +32,7 @@
     <strong>briKVM</strong>
     <span id="status">connecting…</span>
     <span class="label">·</span>
-    <span class="label">click video to capture input · Right ⌘ or Esc to release</span>
+    <span class="label">click video to capture input · Right ⌘, ⌘+⇧, or Esc to release</span>
     <span style="flex:1"></span>
     <button id="ctrlAltDel">Ctrl+Alt+Del</button>
   </div>
@@ -104,6 +104,15 @@ function onKey(e, down) {
   if (!locked) return;
   // Right Command on Mac = escape hatch; swallow it, release pointer lock.
   if (e.code === 'MetaRight') {
+    e.preventDefault();
+    if (down) document.exitPointerLock();
+    return;
+  }
+  // Cmd+Shift (either side) = never pass through — protects against
+  // Mac's Cmd+Shift+3/4/5 screenshot keys firing on the target. The
+  // Mac still gets its system shortcut (OS intercepts those before the
+  // browser can preventDefault), we just make sure the KVM target doesn't.
+  if (e.metaKey && e.shiftKey) {
     e.preventDefault();
     if (down) document.exitPointerLock();
     return;
