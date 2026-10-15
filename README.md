@@ -126,16 +126,17 @@ in Zoom or Teams. You'll see the Mac's camera within a second or two of
 `forward.sh` starting. While the Mac isn't streaming, the camera shows black
 and the mic is silent; the device stays connected either way.
 
-Device indices default to `1:1` (MacBook Pro camera and mic). To list them:
+Device indices default to `0:1` (MacBook Pro camera and mic). To list them:
 
 ```sh
 ffmpeg -f avfoundation -list_devices true -i ""
 VIDEO_IDX=0 AUDIO_IDX=0 ./forward.sh <pi-ip>
 ```
 
-Other knobs: `WIDTH`, `HEIGHT`, `FPS`, `VBITRATE`, `ABITRATE`, `PORT`. If you
-change the resolution or port, set the same values in `/etc/kvm-receiver.env`
-on the Pi. Note that the gadget only advertises 1280×720.
+Other knobs: `WIDTH`/`HEIGHT` (capture mode), `OUT_WIDTH`/`OUT_HEIGHT` (sent
+size, default 640×360), `FPS`, `VBITRATE`, `ABITRATE`, `PORT`. If you change the
+port, set the same `PORT` in `/etc/kvm-receiver.env` on the Pi. The Pi pads or
+scales whatever size arrives to the camera's 640×480 and 1280×720 frames.
 
 ---
 
@@ -146,7 +147,7 @@ on the Pi. Note that the gadget only advertises 1280×720.
 | `kvm-gadget` | `setup-gadget.sh`: builds the configfs composite gadget (HID kbd + mouse, UVC, UAC2) and binds it to the dwc2 UDC. | `/dev/hidg0`, `/dev/hidg1` |
 | `kvm-bridge` | `bridge.py`: serves the web UI and turns WebSocket messages into HID reports. | TCP 8082 |
 | `kvm-ustreamer` | `hdmi-capture.sh`: loads the EDID into the TC358743, then runs ustreamer with the Pi's hardware JPEG encoder. | TCP 8080 |
-| `kvm-receiver` | `receiver.py`: the UVC camera driver. It answers the host's camera control requests, decodes the Mac's stream into MJPEG frames for the USB camera (black frames when idle), and sends PCM to the UAC2 mic. | UDP 1234 |
+| `kvm-receiver` | `receiver.py`: the UVC camera driver. It answers the host's camera control requests, decodes the Mac's stream (on the Pi's hardware H.264 decoder) into YUY2 frames for the USB camera (black frames when idle), and sends PCM to the UAC2 mic. | UDP 1234 |
 
 Logs: `journalctl -fu kvm-<name>`.
 
@@ -166,8 +167,8 @@ sudo /opt/kvm/uvc-mode.sh bulk     # patched, bulk: clean (the default)
 
 | File | Overrides |
 |---|---|
-| `/etc/kvm-gadget.env` | `VENDOR_ID`, `PRODUCT_ID`, `MANUFACTURER`, `PRODUCT`, `SERIAL` (USB identity); `CAMERA_NAME`, `MIC_NAME` (what Windows calls the camera and mic, default "Logitech MeetUp") |
-| `/etc/kvm-receiver.env` | `PORT`, `WIDTH`, `HEIGHT`, `FPS`, `MJPEG_QUALITY`, `UAC2_CARD` |
+| `/etc/kvm-gadget.env` | `VENDOR_ID`, `PRODUCT_ID`, `MANUFACTURER`, `PRODUCT`, `SERIAL` (USB identity); `CAMERA_NAME`, `MIC_NAME` (what Windows calls the camera and mic, default "Logitech MeetUp"); `UVC_MJPEG` (also offer MJPEG 720p30; set it in `kvm-receiver.env` too) |
+| `/etc/kvm-receiver.env` | `PORT`, `UVC_MJPEG`, `MJPEG_QUALITY`, `H264_DECODER`, `UAC2_CARD` |
 | `/etc/kvm-ustreamer.env` | `EDID`, `LISTEN_HOST`, `LISTEN_PORT`, `QUALITY` |
 
 Restart the relevant unit after editing. Changing the USB identity needs
@@ -265,10 +266,19 @@ load the new module.
   reads its source with DMABUF export, which v4l2loopback doesn't implement, so
   the host's camera start timed out (`0xA00F4292`). receiver.py talks to the
   gadget's video node directly: it answers probe/commit, mmaps the gadget's
-  buffers and copies in each JPEG. It must never exit (see the first
+  buffers and copies in each frame. It must never exit (see the first
   troubleshooting item), so it sends black frames when the Mac is idle.
-- **Why MJPEG only.** The camera advertises one format, MJPEG 1280×720 at
-  30 fps. Uncompressed 720p30 needs ~55 MB/s, more than USB 2.0 carries.
+- **Why uncompressed (YUY2), not MJPEG.** The camera advertises YUY2
+  640×480@30 and 1280×720@10 (~18 MB/s each, about what USB 2.0 bulk carries;
+  720p30 would need 55 MB/s). It used to send MJPEG 1280×720@30, but Windows
+  decodes MJPEG with the GPU's hardware JPEG decoder when the app asks for GPU
+  frames (Chrome does), and AMD's (`amf-mft-mjpeg-decoder64.dll`, driver
+  25.10) hangs the GPU after exactly 33 frames, whatever the JPEG: Chrome then
+  sat at "starting your webcam". `tools/mjpegprobe` reproduces it. MJPEG
+  720p30 can be switched back on with `UVC_MJPEG=1` in both `kvm-gadget.env`
+  and `kvm-receiver.env`; with it on, apps asking for 720p30 pick MJPEG.
+  The Mac sends 640×360 H.264 so the Pi only pads it (480p) or upscales it at
+  10 fps (720p): resizing 720p on the Pi took most of its CPU.
 - <a id="why-a-patched-uvc-module"></a>**Why a patched UVC module.** Webcams
   normally stream isochronously: a reserved slot every 125–500 µs. The Pi 4's
   dwc2 controller has no descriptor DMA, so the driver has to re-arm the

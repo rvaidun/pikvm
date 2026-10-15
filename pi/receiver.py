@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Mac stream receiver + USB camera (UVC) and mic (UAC2) driver.
 
-  Mac UDP MPEG-TS --ffmpeg--> MJPEG frames --> this process --> UVC gadget --> host webcam
+  Mac UDP MPEG-TS --ffmpeg--> MJPEG + YUY2 frames --> this process --> UVC gadget --> host webcam
                          +--> raw PCM (localhost UDP) --> ffmpeg --> ALSA UAC2Gadget --> host mic
 
 This process *is* the UVC userspace daemon: it answers the host's UVC
 control requests (format probe/commit, the two image controls the gadget
-advertises), and while the host is streaming it copies the newest JPEG into
-the gadget's mmap'd buffers. When the Mac isn't streaming it sends a black
-placeholder, so the camera always works.
+advertises), and while the host is streaming it copies the newest frame of
+the committed format into the gadget's mmap'd buffers. When the Mac isn't
+streaming it sends a black placeholder, so the camera always works.
+
+The camera offers uncompressed YUY2 640x480@30 and 1280x720@10, plus MJPEG
+1280x720@30 with UVC_MJPEG=1 (MODES; setup-gadget.sh must declare the same
+formats in the same order, so set UVC_MJPEG for both). MJPEG is off by default
+because hosts that decode it on the GPU can't be trusted: AMD's hardware MJPEG
+decoder (driver 25.10) hangs the GPU after 33 frames whatever the JPEG, and
+apps asking for 720p30 would pick MJPEG over YUY2 720p10. USB 2.0 bulk
+carries ~18 MB/s of YUY2, hence the small/slow uncompressed modes.
 
 With the patched usb_f_uvc loaded with bulk=1 (pi/kernel/usb_f_uvc), the
 camera streams over a bulk endpoint. Bulk has no alternate setting for the
@@ -26,9 +34,9 @@ otherwise stall video. The localhost UDP hop never blocks.
 
 Env vars:
   PORT            UDP port the Mac streams to          (default 1234)
-  WIDTH/HEIGHT    Must match the gadget's UVC frame    (default 1280x720)
-  FPS             Re-encode frame rate                  (default 30)
+  UVC_MJPEG       1 = also offer MJPEG 1280x720@30      (default 0; must match setup-gadget.sh)
   MJPEG_QUALITY   ffmpeg -q:v, 2 (best) .. 31 (worst)   (default 7)
+  H264_DECODER    ffmpeg decoder for the Mac stream     (default h264_v4l2m2m; h264 = software)
   AUDIO_PORT      localhost port for the PCM hop        (default 1236)
   UAC2_CARD       ALSA device for the gadget mic        (default hw:UAC2Gadget)
   GADGET          configfs gadget name                  (default brikvm)
@@ -49,10 +57,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("receiver")
 
 PORT = int(os.environ.get("PORT", "1234"))
-WIDTH = int(os.environ.get("WIDTH", "1280"))
-HEIGHT = int(os.environ.get("HEIGHT", "720"))
-FPS = int(os.environ.get("FPS", "30"))
 MJPEG_QUALITY = os.environ.get("MJPEG_QUALITY", "7")
+# The Pi 4's hardware decoder takes ~1/5 of the CPU software h264 needs for
+# the Mac's 720p30 stream.
+H264_DECODER = os.environ.get("H264_DECODER", "h264_v4l2m2m")
 AUDIO_PORT = int(os.environ.get("AUDIO_PORT", "1236"))
 UAC2_CARD = os.environ.get("UAC2_CARD", "hw:UAC2Gadget")
 GADGET = os.environ.get("GADGET", "brikvm")
@@ -80,6 +88,8 @@ V4L2_BUF_TYPE_VIDEO_OUTPUT = 2
 V4L2_MEMORY_MMAP = 1
 V4L2_FIELD_NONE = 1
 V4L2_PIX_FMT_MJPEG = 0x47504A4D     # 'MJPG'
+V4L2_PIX_FMT_YUYV = 0x56595559      # 'YUYV' (UVC's YUY2)
+V4L2_COLORSPACE_REC709 = 3
 V4L2_COLORSPACE_JPEG = 7
 BUF_SIZE = 88
 
@@ -96,20 +106,50 @@ UVC_VS_PROBE_CONTROL, UVC_VS_COMMIT_CONTROL = 0x01, 0x02
 # f_uvc rewrites wIndex's interface byte for userspace: 0 = control, 1 = streaming.
 UVC_INTF_CONTROL, UVC_INTF_STREAMING = 0, 1
 
+class Mode:
+    """One UVC format/frame the gadget advertises, and the frames that feed it."""
+
+    def __init__(self, source: str, fourcc: int, width: int, height: int, fps: int):
+        self.source, self.fourcc = source, fourcc
+        self.width, self.height, self.fps = width, height, fps
+        self.interval = 10_000_000 // fps     # 100 ns units
+        self.frame_size = width * height * 2  # YUY2 size; also the MJPEG buffer size
+
+    @property
+    def raw(self) -> bool:
+        return self.fourcc == V4L2_PIX_FMT_YUYV
+
+
+def build_modes(mjpeg: bool) -> dict[tuple[int, int], Mode]:
+    """(bFormatIndex, bFrameIndex) -> Mode, numbered like setup-gadget.sh
+    declares them: the uncompressed format first (frames in creation order),
+    then MJPEG when UVC_MJPEG=1."""
+    modes = {
+        (1, 1): Mode("yuy2-480", V4L2_PIX_FMT_YUYV, 640, 480, 30),
+        (1, 2): Mode("yuy2-720", V4L2_PIX_FMT_YUYV, 1280, 720, 10),
+    }
+    if mjpeg:
+        modes[(2, 1)] = Mode("mjpeg", V4L2_PIX_FMT_MJPEG, 1280, 720, 30)
+    return modes
+
+
+MODES = build_modes(os.environ.get("UVC_MJPEG", "0") == "1")
+DEFAULT_MODE = (1, 1)
+
 # struct uvc_streaming_control (UVC 1.1, 34 bytes, packed little-endian)
 STREAMING_CTRL = struct.Struct("<HBBIHHHHHIIIBBBB")
-FRAME_INTERVAL = 10_000_000 // 30   # 100 ns units; the gadget advertises 30 fps only
 
 
-def streaming_ctrl(max_payload: int) -> bytes:
+def streaming_ctrl(key: tuple[int, int], max_payload: int) -> bytes:
+    mode = MODES[key]
     return STREAMING_CTRL.pack(
         1,                      # bmHint: dwFrameInterval is fixed
-        1, 1,                   # bFormatIndex, bFrameIndex (MJPEG 1280x720, the only one)
-        FRAME_INTERVAL,
+        key[0], key[1],         # bFormatIndex, bFrameIndex
+        mode.interval,
         0, 0, 0, 0, 0,          # wKeyFrameRate .. wDelay
-        WIDTH * HEIGHT * 2,     # dwMaxVideoFrameSize, matches dwMaxVideoFrameBufferSize
+        mode.frame_size,        # dwMaxVideoFrameSize, matches dwMaxVideoFrameBufferSize
         max_payload,            # dwMaxPayloadTransferSize
-        0,                      # dwClockFrequency
+        48_000_000,             # dwClockFrequency: the gadget's PTS/SCR clock
         3, 1, 1, 1)             # bmFramingInfo (FID+EOF), preferred/min/max payload version
 
 
@@ -124,11 +164,13 @@ CONTROLS = {
 }
 
 
-def make_placeholder() -> bytes:
+def make_placeholder(mode: Mode) -> bytes:
+    if mode.raw:
+        return b"\x10\x80" * (mode.width * mode.height)   # black, limited range
     return subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-         "-f", "lavfi", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}",
-         "-frames:v", "1", "-pix_fmt", "yuvj420p", "-f", "mjpeg", "-"],
+         "-f", "lavfi", "-i", f"color=c=black:s={mode.width}x{mode.height}",
+         "-frames:v", "1", "-pix_fmt", "yuvj422p", "-huffman", "default", "-f", "mjpeg", "-"],
         check=True, capture_output=True).stdout
 
 
@@ -177,21 +219,74 @@ def read_mpjpeg(stream, store: FrameStore):
         store.push(data)
 
 
-def receiver_loop(store: FrameStore):
-    """Run the UDP -> MJPEG decoder, respawning it whenever it exits."""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-           "-fflags", "+nobuffer+discardcorrupt", "-flags", "low_delay",
-           "-i", f"udp://0.0.0.0:{PORT}?overrun_nonfatal=1&fifo_size=1000000&timeout={UDP_TIMEOUT_US}",
-           "-map", "0:v",
-           "-vf", f"scale={WIDTH}:{HEIGHT},fps={FPS},format=yuvj420p",
-           "-c:v", "mjpeg", "-q:v", MJPEG_QUALITY, "-f", "mpjpeg", "pipe:1",
-           "-map", "0:a", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
-           "-f", "s16le", f"udp://127.0.0.1:{AUDIO_PORT}?pkt_size=1024"]
+def read_raw(stream, size: int, store: FrameStore):
+    """Split ffmpeg's rawvideo output into fixed-size frames."""
     while True:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        read_mpjpeg(proc.stdout, store)
-        proc.wait()
-        time.sleep(0.5)
+        frame = bytearray(size)
+        view, got = memoryview(frame), 0
+        while got < size:
+            n = stream.readinto(view[got:])
+            if not n:
+                return
+            got += n
+        store.push(bytes(frame))
+
+
+def fit(mode: Mode) -> str:
+    """Scale filter that letterboxes the 16:9 Mac picture into the mode's frame."""
+    return (f"scale={mode.width}:{mode.height}:force_original_aspect_ratio=decrease,"
+            f"pad={mode.width}:{mode.height}:(ow-iw)/2:(oh-ih)/2")
+
+
+class Decoder:
+    """Runs the UDP -> frames ffmpeg for one mode, the one the host committed.
+
+    Producing every mode at once costs the Pi ~1.7 cores, so a switch to a
+    different mode restarts ffmpeg instead (about a second of placeholder
+    frames while it waits for the Mac's next keyframe). ffmpeg also carries
+    the mic audio, so that gaps too.
+    """
+
+    def __init__(self, stores: dict[str, FrameStore]):
+        self.stores = stores
+        self.mode = MODES[DEFAULT_MODE]
+        self.proc: subprocess.Popen | None = None
+        self.switching = False
+
+    def select(self, mode: Mode):
+        if mode.source == self.mode.source:
+            return
+        self.mode, self.switching = mode, True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def command(self, mode: Mode) -> list[str]:
+        if mode.raw:
+            video = ["-vf", f"fps={mode.fps},{fit(mode)},format=yuyv422", "-f", "rawvideo"]
+        else:
+            video = ["-vf", f"fps={mode.fps},{fit(mode)},format=yuvj422p",
+                     "-c:v", "mjpeg", "-huffman", "default", "-q:v", MJPEG_QUALITY, "-f", "mpjpeg"]
+        return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-fflags", "+nobuffer+discardcorrupt", "-flags", "low_delay",
+                "-c:v", H264_DECODER,
+                "-i", f"udp://0.0.0.0:{PORT}?overrun_nonfatal=1&fifo_size=1000000&timeout={UDP_TIMEOUT_US}",
+                "-map", "0:v", *video, "pipe:1",
+                "-map", "0:a", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+                "-f", "s16le", f"udp://127.0.0.1:{AUDIO_PORT}?pkt_size=1024"]
+
+    def run(self):
+        """Respawn ffmpeg whenever it exits (Mac gone quiet, or a mode switch)."""
+        while True:
+            mode, self.switching = self.mode, False
+            self.proc = subprocess.Popen(self.command(mode), stdout=subprocess.PIPE)
+            store = self.stores[mode.source]
+            if mode.raw:
+                read_raw(self.proc.stdout, mode.frame_size, store)
+            else:
+                read_mpjpeg(self.proc.stdout, store)
+            self.proc.wait()
+            if not self.switching:
+                time.sleep(0.5)
 
 
 # --- UVC gadget --------------------------------------------------------------
@@ -211,9 +306,10 @@ def find_uvc_node() -> str:
 class UvcCamera:
     NBUFS = 4
 
-    def __init__(self, path: str, store: FrameStore, placeholder: bytes):
-        self.store = store
-        self.placeholder = placeholder
+    def __init__(self, path: str, decoder: Decoder, placeholders: dict[str, bytes]):
+        self.decoder = decoder
+        self.stores = decoder.stores
+        self.placeholders = placeholders
         self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
         params = Path("/sys/module/usb_f_uvc/parameters")
         self.bulk = (params / "bulk").exists() and (params / "bulk").read_text().strip() == "Y"
@@ -221,7 +317,9 @@ class UvcCamera:
             max_payload = int((params / "bulk_payload").read_text())
         else:
             max_payload = int(Path(f"/sys/kernel/config/usb_gadget/{GADGET}/functions/uvc.usb0/streaming_maxpacket").read_text())
-        self.ctrl = streaming_ctrl(max_payload)
+        self.max_payload = max_payload
+        self.probe = DEFAULT_MODE     # what the host last proposed (PROBE)
+        self.mode = DEFAULT_MODE      # what it committed (COMMIT), i.e. what we stream
         self.values = {k: v["cur"] for k, v in CONTROLS.items()}
         self.pending_set = None       # (interface, entity, selector) awaiting its DATA stage
         self.maps: list[mmap.mmap] = []
@@ -259,8 +357,13 @@ class UvcCamera:
             if req == UVC_SET_CUR:
                 self.pending_set = (intf, entity, cs)
                 return self.respond(bytes(min(length, STREAMING_CTRL.size)))
-            if req in (UVC_GET_CUR, UVC_GET_MIN, UVC_GET_MAX, UVC_GET_DEF):
-                return self.respond(self.ctrl[:length])   # one format/frame/interval: all the same
+            if req == UVC_GET_DEF:
+                return self.respond(streaming_ctrl(DEFAULT_MODE, self.max_payload)[:length])
+            if req in (UVC_GET_CUR, UVC_GET_MIN, UVC_GET_MAX):
+                # Each frame has a single interval, so the probed format/frame
+                # pins every negotiable field: min = max = cur.
+                key = self.probe if cs == UVC_VS_PROBE_CONTROL else self.mode
+                return self.respond(streaming_ctrl(key, self.max_payload)[:length])
             if req == UVC_GET_RES:
                 return self.respond(bytes(min(length, STREAMING_CTRL.size)))
             if req == UVC_GET_LEN:
@@ -293,14 +396,25 @@ class UvcCamera:
             return
         intf, entity, cs = target
         if intf == UVC_INTF_STREAMING:
-            if cs == UVC_VS_COMMIT_CONTROL:
-                log.info("Host committed MJPEG %dx%d @ %d fps", WIDTH, HEIGHT, 10_000_000 // FRAME_INTERVAL)
+            # bFormatIndex/bFrameIndex follow the 2-byte bmHint. An unknown
+            # pair falls back to the default; dwFrameInterval is ignored since
+            # each frame has exactly one.
+            key = tuple(payload[2:4]) if len(payload) >= 4 else DEFAULT_MODE
+            key = key if key in MODES else DEFAULT_MODE
+            if cs == UVC_VS_PROBE_CONTROL:
+                self.probe = key
+            elif cs == UVC_VS_COMMIT_CONTROL:
+                self.mode = self.probe = key
+                mode = MODES[key]
+                self.decoder.select(mode)
+                log.info("Host committed %s %dx%d @ %d fps", "YUY2" if mode.raw else "MJPEG",
+                         mode.width, mode.height, mode.fps)
                 if self.bulk:
                     # No alt setting to select with bulk: a commit is the start
                     # signal. The host never says when it stops, so a new
                     # commit restarts the stream (flushing what it never read).
                     self.stream_on()
-            return    # only one format exists, so probe/commit always resolve to self.ctrl
+            return
         spec = CONTROLS[(entity, cs)]
         self.values[(entity, cs)] = struct.unpack_from(spec["fmt"], payload.ljust(4, b"\0"))[0]
 
@@ -308,10 +422,13 @@ class UvcCamera:
     def stream_on(self):
         if self.streaming:
             self.stream_off()
+        mode = MODES[self.mode]
         fmt = bytearray(208)
         struct.pack_into("<I", fmt, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT)
-        struct.pack_into("<12I", fmt, 8, WIDTH, HEIGHT, V4L2_PIX_FMT_MJPEG, V4L2_FIELD_NONE,
-                         0, WIDTH * HEIGHT * 2, V4L2_COLORSPACE_JPEG, 0, 0, 0, 0, 0)
+        struct.pack_into("<12I", fmt, 8, mode.width, mode.height, mode.fourcc, V4L2_FIELD_NONE,
+                         mode.width * 2 if mode.raw else 0, mode.frame_size,
+                         V4L2_COLORSPACE_REC709 if mode.raw else V4L2_COLORSPACE_JPEG,
+                         0, 0, 0, 0, 0)
         fcntl.ioctl(self.fd, VIDIOC_S_FMT, fmt)
         rb = bytearray(struct.pack("<IIII4x", self.NBUFS, V4L2_BUF_TYPE_VIDEO_OUTPUT, V4L2_MEMORY_MMAP, 0))
         fcntl.ioctl(self.fd, VIDIOC_REQBUFS, rb)
@@ -346,9 +463,14 @@ class UvcCamera:
         log.info("Host stopped streaming")
 
     @staticmethod
-    def _buf(index: int, bytesused: int = 0) -> bytearray:
+    def _buf(index: int, bytesused: int = 0, timestamp: float = 0.0) -> bytearray:
         b = bytearray(BUF_SIZE)
         struct.pack_into("<IIIII", b, 0, index, V4L2_BUF_TYPE_VIDEO_OUTPUT, bytesused, 0, V4L2_FIELD_NONE)
+        # struct timeval at 24. The gadget copies it into the payload header
+        # as the PTS (48 MHz, CLOCK_MONOTONIC like its SCR); a zero timestamp
+        # leaves the PTS out.
+        usec = int(timestamp * 1_000_000)
+        struct.pack_into("<qq", b, 24, usec // 1_000_000, usec % 1_000_000)
         struct.pack_into("<I", b, 60, V4L2_MEMORY_MMAP)
         return b
 
@@ -367,7 +489,8 @@ class UvcCamera:
             return
 
         now = time.monotonic()
-        seq, when, frame = self.store.latest
+        source = MODES[self.mode].source
+        seq, when, frame = self.stores[source].latest
         live = bool(frame) and now - when < STALE_AFTER
         if live != self.live:
             log.info("Mac stream %s", "live" if live else "idle; sending placeholder")
@@ -379,7 +502,7 @@ class UvcCamera:
         else:
             if now - self.sent_at < 1 / PLACEHOLDER_FPS:
                 return
-            frame = self.placeholder
+            frame = self.placeholders[source]
 
         idx = self.free.pop()
         m = self.maps[idx]
@@ -388,7 +511,7 @@ class UvcCamera:
             self.free.append(idx)
             return
         m[:len(frame)] = frame
-        fcntl.ioctl(self.fd, VIDIOC_QBUF, self._buf(idx, len(frame)))
+        fcntl.ioctl(self.fd, VIDIOC_QBUF, self._buf(idx, len(frame), time.monotonic()))
         self.sent_at = now
 
     def handle_events(self):
@@ -423,18 +546,19 @@ class UvcCamera:
         # (POLLPRI only) ignores.
         while True:
             writers = [self.fd] if self.streaming else []
-            select.select([], writers, [self.fd], 1 / (FPS * 2))
+            select.select([], writers, [self.fd], 1 / (MODES[self.mode].fps * 2))
             self.handle_events()
             self.pump()
 
 
 def main():
-    placeholder = make_placeholder()
-    store = FrameStore()
+    sources = {m.source: m for m in MODES.values()}
+    placeholders = {name: make_placeholder(m) for name, m in sources.items()}
+    decoder = Decoder({name: FrameStore() for name in sources})
     threading.Thread(target=audio_sink_loop, daemon=True).start()
-    threading.Thread(target=receiver_loop, args=(store,), daemon=True).start()
+    threading.Thread(target=decoder.run, daemon=True).start()
     log.info("Listening for the Mac stream on udp://0.0.0.0:%d", PORT)
-    UvcCamera(find_uvc_node(), store, placeholder).run()
+    UvcCamera(find_uvc_node(), decoder, placeholders).run()
 
 
 if __name__ == "__main__":

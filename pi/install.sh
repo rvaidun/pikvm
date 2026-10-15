@@ -118,11 +118,11 @@ fi
 
 if [ ! -f /etc/kvm-receiver.env ]; then
   cat > /etc/kvm-receiver.env <<'EOF'
-# Override the Mac->Pi stream parameters. Must match the Mac's forward.sh.
+# Override receiver.py settings (see its docstring). PORT must match forward.sh;
+# UVC_MJPEG must match /etc/kvm-gadget.env.
 # PORT=1234
-# WIDTH=1280
-# HEIGHT=720
-# FPS=30
+# UVC_MJPEG=0
+# H264_DECODER=h264_v4l2m2m
 EOF
 fi
 

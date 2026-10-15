@@ -52,8 +52,10 @@ if [ -d "$GADGET_DIR" ]; then
     if [ -d "$U" ]; then
       rm -f "$U"/control/class/fs/h "$U"/control/class/ss/h
       rm -f "$U"/streaming/class/fs/h "$U"/streaming/class/hs/h "$U"/streaming/class/ss/h
-      rm -f "$U"/streaming/header/h/m
-      rmdir "$U"/streaming/header/h "$U"/streaming/mjpeg/m/720p "$U"/streaming/mjpeg/m 2>/dev/null || true
+      rm -f "$U"/streaming/header/h/m "$U"/streaming/header/h/u
+      rmdir "$U"/streaming/header/h 2>/dev/null || true
+      rmdir "$U"/streaming/mjpeg/m/* "$U"/streaming/uncompressed/u/* 2>/dev/null || true
+      rmdir "$U"/streaming/mjpeg/m "$U"/streaming/uncompressed/u 2>/dev/null || true
       rmdir "$U"/control/header/h "$U" 2>/dev/null || true
     fi
     rmdir functions/hid.usb0 functions/hid.usb1 functions/uac2.usb0 2>/dev/null || true
@@ -116,7 +118,9 @@ echo 1 > functions/hid.usb1/no_out_endpoint  # mice have no output reports
 echo -ne '\x05\x01\x09\x02\xA1\x01\x09\x01\xA1\x00\x05\x09\x19\x01\x29\x03\x15\x00\x25\x01\x95\x03\x75\x01\x81\x02\x95\x01\x75\x05\x81\x03\x05\x01\x09\x30\x09\x31\x09\x38\x15\x81\x25\x7F\x75\x08\x95\x03\x81\x06\xC0\xC0' \
   > functions/hid.usb1/report_desc
 
-# --- UVC function (1280x720 MJPG @ 30fps) -----------------------------------
+# --- UVC function (YUY2 640x480@30 + 1280x720@10; MJPG 1280x720@30 opt-in) --
+# receiver.py's MODES must list the same formats/frames in the same order;
+# set UVC_MJPEG the same for both (kvm-gadget and kvm-receiver env files).
 mkdir -p functions/uvc.usb0/control/header/h
 echo "$CAMERA_NAME" > functions/uvc.usb0/function_name
 # The patched usb_f_uvc that install.sh builds streams over bulk
@@ -132,20 +136,31 @@ ln -s header/h class/fs
 ln -s header/h class/ss
 cd -
 
-mkdir -p functions/uvc.usb0/streaming/mjpeg/m/720p
-cd functions/uvc.usb0/streaming/mjpeg/m/720p
-echo 1280                 > wWidth
-echo 720                  > wHeight
-echo 333333               > dwDefaultFrameInterval   # 100ns units -> 30fps
-echo 333333               > dwFrameInterval
-echo $((1280 * 720 * 2))  > dwMinBitRate
-echo $((1280 * 720 * 2))  > dwMaxBitRate
-echo $((1280 * 720 * 2))  > dwMaxVideoFrameBufferSize
-cd -
+# uvc_frame <dir> <width> <height> <fps>: one frame size with a single
+# interval. Bit rates are in bits/s, worst case (uncompressed 16 bpp).
+uvc_frame() {
+  mkdir -p "$1"
+  echo "$2"                         > "$1/wWidth"
+  echo "$3"                         > "$1/wHeight"
+  echo $((10000000 / $4))           > "$1/dwDefaultFrameInterval"   # 100 ns units
+  echo $((10000000 / $4))           > "$1/dwFrameInterval"
+  echo $(($2 * $3 * 16 * $4))       > "$1/dwMinBitRate"
+  echo $(($2 * $3 * 16 * $4))       > "$1/dwMaxBitRate"
+  echo $(($2 * $3 * 2))             > "$1/dwMaxVideoFrameBufferSize"
+}
+S=functions/uvc.usb0/streaming
+# YUY2 (the uncompressed format's default GUID), so hosts need no JPEG
+# decoder: AMD's hardware MJPEG decoder hangs the GPU after 33 frames, which
+# breaks Chrome on AMD laptops. Bulk carries ~18 MB/s, hence 480p30 / 720p10.
+uvc_frame $S/uncompressed/u/480p 640 480 30
+uvc_frame $S/uncompressed/u/720p 1280 720 10
+# MJPEG would win any 720p30 request over YUY2 720p10, so it's opt-in.
+if [ "${UVC_MJPEG:-0}" = 1 ]; then uvc_frame $S/mjpeg/m/720p 1280 720 30; fi
 
-mkdir -p functions/uvc.usb0/streaming/header/h
-cd functions/uvc.usb0/streaming/header/h
-ln -s ../../mjpeg/m .
+mkdir -p $S/header/h
+cd $S/header/h
+ln -s ../../uncompressed/u .
+if [ "${UVC_MJPEG:-0}" = 1 ]; then ln -s ../../mjpeg/m .; fi
 cd -
 for speed in fs hs ss; do
   cd functions/uvc.usb0/streaming/class/$speed
