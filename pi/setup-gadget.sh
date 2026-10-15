@@ -72,10 +72,12 @@ echo "$VENDOR_ID"  > idVendor
 echo "$PRODUCT_ID" > idProduct
 echo 0x0111        > bcdDevice      # device v1.11
 echo 0x0200        > bcdUSB         # USB 2.0
-# Composite devices: 0x00 in device class lets each interface declare its own.
-echo 0x00 > bDeviceClass
-echo 0x00 > bDeviceSubClass
-echo 0x00 > bDeviceProtocol
+# Miscellaneous / Interface Association Descriptor class. UVC and UAC2 group
+# their interfaces with IADs, and Windows' usbccgp only honors IADs when the
+# device declares 0xEF/0x02/0x01; with 0x00 the camera and mic split apart.
+echo 0xEF > bDeviceClass
+echo 0x02 > bDeviceSubClass
+echo 0x01 > bDeviceProtocol
 
 mkdir -p strings/0x409
 echo "$SERIAL"       > strings/0x409/serialnumber
@@ -94,6 +96,10 @@ mkdir -p functions/hid.usb0
 echo 1 > functions/hid.usb0/protocol         # 1 = keyboard
 echo 1 > functions/hid.usb0/subclass         # 1 = boot interface
 echo 8 > functions/hid.usb0/report_length
+# No interrupt OUT endpoint: with one, f_hid stalls SET_REPORT on ep0, and
+# Windows' keyboard driver (which sets the lock LEDs that way at start) then
+# never polls the keyboard. LED reports still arrive, readable from /dev/hidg0.
+echo 1 > functions/hid.usb0/no_out_endpoint
 echo -ne '\x05\x01\x09\x06\xA1\x01\x05\x07\x19\xE0\x29\xE7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x01\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x01\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xC0' \
   > functions/hid.usb0/report_desc
 
@@ -102,6 +108,7 @@ mkdir -p functions/hid.usb1
 echo 0 > functions/hid.usb1/protocol         # 0 = none (report protocol only)
 echo 0 > functions/hid.usb1/subclass
 echo 4 > functions/hid.usb1/report_length
+echo 1 > functions/hid.usb1/no_out_endpoint  # mice have no output reports
 echo -ne '\x05\x01\x09\x02\xA1\x01\x09\x01\xA1\x00\x05\x09\x19\x01\x29\x03\x15\x00\x25\x01\x95\x03\x75\x01\x81\x02\x95\x01\x75\x05\x81\x03\x05\x01\x09\x30\x09\x31\x09\x38\x15\x81\x25\x7F\x75\x08\x95\x03\x81\x06\xC0\xC0' \
   > functions/hid.usb1/report_desc
 

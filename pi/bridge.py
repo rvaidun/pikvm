@@ -23,6 +23,7 @@ Wire protocol (unchanged from the Pico era, newline-terminated ASCII):
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -41,8 +42,14 @@ MOD_FIRST, MOD_LAST = 0xE0, 0xE7
 
 
 class HidWriter:
-    """Owns an open fd to a /dev/hidg* endpoint. Reopens on EIO/ENODEV
+    """Owns an open fd to a /dev/hidg* endpoint. Reopens on EIO/ENODEV/ESHUTDOWN
     (host port cycled, gadget rebound)."""
+
+    # f_hid holds one report in flight; a non-blocking write returns EAGAIN
+    # until the host has polled the previous one (every ~1 ms when healthy).
+    # Retry briefly instead of dropping it, so a fast key-up isn't lost.
+    BUSY_RETRY_S = 0.002
+    BUSY_TIMEOUT_S = 0.25
 
     def __init__(self, path: str, report_len: int):
         self.path = path
@@ -54,26 +61,37 @@ class HidWriter:
         self.fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
         log.info("HID endpoint opened: %s", self.path)
 
+    def _close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        self.fd = None
+
     async def write(self, report: bytes):
         assert len(report) == self.report_len, (len(report), self.report_len)
         async with self.lock:
             for _ in range(2):
                 if self.fd is None:
                     try:
-                        await asyncio.to_thread(self._open)
+                        self._open()
                     except OSError as e:
                         log.warning("open %s failed: %s", self.path, e)
                         return
+                deadline = time.monotonic() + self.BUSY_TIMEOUT_S
                 try:
-                    await asyncio.to_thread(os.write, self.fd, report)
-                    return
+                    while True:
+                        try:
+                            os.write(self.fd, report)
+                            return
+                        except BlockingIOError:
+                            if time.monotonic() > deadline:
+                                log.warning("%s: host isn't polling; dropped report", self.path)
+                                return
+                            await asyncio.sleep(self.BUSY_RETRY_S)
                 except OSError as e:
                     log.warning("write %s failed: %s — reopening", self.path, e)
-                    try:
-                        os.close(self.fd)
-                    except OSError:
-                        pass
-                    self.fd = None
+                    self._close()
 
 
 class Keyboard:
