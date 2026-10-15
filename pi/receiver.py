@@ -239,54 +239,66 @@ def fit(mode: Mode) -> str:
 
 
 class Decoder:
-    """Runs the UDP -> frames ffmpeg for one mode, the one the host committed.
+    """Runs one UDP -> frames ffmpeg that feeds every mode at once.
 
-    Producing every mode at once costs the Pi ~1.7 cores, so a switch to a
-    different mode restarts ffmpeg instead (about a second of placeholder
-    frames while it waits for the Mac's next keyframe). ffmpeg also carries
-    the mic audio, so that gaps too.
+    Each mode gets its own pipe and reader thread, and its FrameStore always
+    holds a current frame, so when the host switches modes (Chrome opens
+    480p, then moves to 720p) the next frame is already there. Restarting
+    ffmpeg per mode instead left a second of black frames on every switch.
+    With the Mac sending 640x360 this is cheap: 480p only pads, and 720p
+    upscales at 10 fps. ffmpeg also carries the mic audio.
     """
 
     def __init__(self, stores: dict[str, FrameStore]):
         self.stores = stores
-        self.mode = MODES[DEFAULT_MODE]
-        self.proc: subprocess.Popen | None = None
-        self.switching = False
 
-    def select(self, mode: Mode):
-        if mode.source == self.mode.source:
-            return
-        self.mode, self.switching = mode, True
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-
-    def command(self, mode: Mode) -> list[str]:
-        if mode.raw:
-            video = ["-vf", f"fps={mode.fps},{fit(mode)},format=yuyv422", "-f", "rawvideo"]
-        else:
-            video = ["-vf", f"fps={mode.fps},{fit(mode)},format=yuvj422p",
-                     "-c:v", "mjpeg", "-huffman", "default", "-q:v", MJPEG_QUALITY, "-f", "mpjpeg"]
+    @staticmethod
+    def command(outputs: list[tuple[Mode, int]]) -> list[str]:
+        """ffmpeg arguments writing each (mode, pipe fd) pair's frames to its fd."""
+        graph = [f"[0:v]split={len(outputs)}" + "".join(f"[s{i}]" for i in range(len(outputs)))]
+        args = []
+        for i, (mode, fd) in enumerate(outputs):
+            if mode.raw:
+                graph.append(f"[s{i}]fps={mode.fps},{fit(mode)},format=yuyv422[o{i}]")
+                args += ["-map", f"[o{i}]", "-f", "rawvideo", f"pipe:{fd}"]
+            else:
+                graph.append(f"[s{i}]fps={mode.fps},{fit(mode)},format=yuvj422p[o{i}]")
+                args += ["-map", f"[o{i}]", "-c:v", "mjpeg", "-huffman", "default",
+                         "-q:v", MJPEG_QUALITY, "-f", "mpjpeg", f"pipe:{fd}"]
         return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
                 "-fflags", "+nobuffer+discardcorrupt", "-flags", "low_delay",
                 "-c:v", H264_DECODER,
                 "-i", f"udp://0.0.0.0:{PORT}?overrun_nonfatal=1&fifo_size=1000000&timeout={UDP_TIMEOUT_US}",
-                "-map", "0:v", *video, "pipe:1",
+                "-filter_complex", ";".join(graph), *args,
                 "-map", "0:a", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
                 "-f", "s16le", f"udp://127.0.0.1:{AUDIO_PORT}?pkt_size=1024"]
 
     def run(self):
-        """Respawn ffmpeg whenever it exits (Mac gone quiet, or a mode switch)."""
+        """Respawn ffmpeg whenever it exits (the Mac went quiet)."""
+        modes = list({m.source: m for m in MODES.values()}.values())
         while True:
-            mode, self.switching = self.mode, False
-            self.proc = subprocess.Popen(self.command(mode), stdout=subprocess.PIPE)
-            store = self.stores[mode.source]
+            pipes = [os.pipe() for _ in modes]
+            proc = subprocess.Popen(self.command([(m, w) for m, (_, w) in zip(modes, pipes)]),
+                                    pass_fds=[w for _, w in pipes])
+            readers = []
+            for mode, (r, w) in zip(modes, pipes):
+                os.close(w)
+                readers.append(threading.Thread(target=self.read, args=(r, mode), daemon=True))
+            for t in readers:
+                t.start()
+            proc.wait()
+            for t in readers:
+                t.join()
+            time.sleep(0.5)
+
+    def read(self, fd: int, mode: Mode):
+        store = self.stores[mode.source]
+        # read_raw copes with short reads; read_mpjpeg needs a buffered stream.
+        with open(fd, "rb", buffering=0 if mode.raw else -1) as stream:
             if mode.raw:
-                read_raw(self.proc.stdout, mode.frame_size, store)
+                read_raw(stream, mode.frame_size, store)
             else:
-                read_mpjpeg(self.proc.stdout, store)
-            self.proc.wait()
-            if not self.switching:
-                time.sleep(0.5)
+                read_mpjpeg(stream, store)
 
 
 # --- UVC gadget --------------------------------------------------------------
@@ -406,7 +418,6 @@ class UvcCamera:
             elif cs == UVC_VS_COMMIT_CONTROL:
                 self.mode = self.probe = key
                 mode = MODES[key]
-                self.decoder.select(mode)
                 log.info("Host committed %s %dx%d @ %d fps", "YUY2" if mode.raw else "MJPEG",
                          mode.width, mode.height, mode.fps)
                 if self.bulk:
