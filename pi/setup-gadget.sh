@@ -14,7 +14,7 @@
 # Runs at boot via kvm-gadget.service. Idempotent.
 set -euo pipefail
 
-GADGET_NAME="brikvm"
+GADGET_NAME="rahkvm"
 GADGET_DIR="/sys/kernel/config/usb_gadget/${GADGET_NAME}"
 
 # --- Spoofed device identity (override via /etc/kvm-gadget.env) -------------
@@ -66,7 +66,7 @@ fi
 # `setup-gadget.sh teardown` stops here, so the function modules can be
 # unloaded and swapped (uvc-mode.sh).
 if [ "${1:-}" = "teardown" ]; then
-  echo "briKVM gadget removed"
+  echo "rahKVM gadget removed"
   exit 0
 fi
 
@@ -92,7 +92,7 @@ echo "$PRODUCT"      > strings/0x409/product
 
 # --- Configuration -----------------------------------------------------------
 mkdir -p configs/c.1/strings/0x409
-echo "briKVM composite" > configs/c.1/strings/0x409/configuration
+echo "rahKVM composite" > configs/c.1/strings/0x409/configuration
 echo 500                > configs/c.1/MaxPower       # mA; UVC+UAC2 want headroom
 echo 0xA0               > configs/c.1/bmAttributes   # bus-powered, remote wakeup
 
@@ -206,6 +206,6 @@ if [ -n "$IRQ" ]; then
   echo "${USB_IRQ_CPU:-3}" > "/proc/irq/$IRQ/smp_affinity_list" 2>/dev/null || true
 fi
 
-echo "briKVM gadget bound to $UDC as ${MANUFACTURER} ${PRODUCT} (${VENDOR_ID}:${PRODUCT_ID})"
+echo "rahKVM gadget bound to $UDC as ${MANUFACTURER} ${PRODUCT} (${VENDOR_ID}:${PRODUCT_ID})"
 echo "Devices: /dev/hidg0 (kbd), /dev/hidg1 (mouse), uvc.usb0 (camera),"
 echo "         hw:UAC2Gadget (mic)"

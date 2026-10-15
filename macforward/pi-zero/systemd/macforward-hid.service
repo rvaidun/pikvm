@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM MacForward: TCP -> USB HID bridge
+Description=rahKVM MacForward: TCP -> USB HID bridge
 After=macforward-gadget.service
 Requires=macforward-gadget.service
 

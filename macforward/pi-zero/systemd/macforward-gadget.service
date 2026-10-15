@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM MacForward: create UVC+UAC2 USB gadget
+Description=rahKVM MacForward: create UVC+UAC2 USB gadget
 After=sys-kernel-config.mount
 Before=macforward-uvc.service macforward-receiver.service
 

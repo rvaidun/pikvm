@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM receiver + UVC camera driver (Mac UDP -> USB camera + UAC2 mic)
+Description=rahKVM receiver + UVC camera driver (Mac UDP -> USB camera + UAC2 mic)
 After=kvm-gadget.service network-online.target
 Requires=kvm-gadget.service
 Wants=network-online.target

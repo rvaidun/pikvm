@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM USB composite gadget (keyboard + mouse + camera + mic)
+Description=rahKVM USB composite gadget (keyboard + mouse + camera + mic)
 # Must run before anything that writes /dev/hidg*.
 Before=kvm-bridge.service
 # ConfigFS has to be mounted first (it is on Raspberry Pi OS by default,
@@ -12,7 +12,7 @@ RemainAfterExit=yes
 EnvironmentFile=-/etc/kvm-gadget.env
 ExecStart=/opt/kvm/setup-gadget.sh
 # Unbind the gadget on stop so we don't leak a half-dead instance.
-ExecStop=/bin/sh -c 'echo "" > /sys/kernel/config/usb_gadget/brikvm/UDC 2>/dev/null || true'
+ExecStop=/bin/sh -c 'echo "" > /sys/kernel/config/usb_gadget/rahkvm/UDC 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target

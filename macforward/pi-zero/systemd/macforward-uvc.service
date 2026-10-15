@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM MacForward: uvc-gadget daemon (loopback -> USB UVC)
+Description=rahKVM MacForward: uvc-gadget daemon (loopback -> USB UVC)
 After=macforward-gadget.service
 Requires=macforward-gadget.service
 

@@ -43,8 +43,8 @@ echo 0x0100 > bcdDevice
 echo 0x0200 > bcdUSB
 mkdir -p strings/0x409
 echo "0001"              > strings/0x409/serialnumber
-echo "briKVM"            > strings/0x409/manufacturer
-echo "briKVM MacForward" > strings/0x409/product
+echo "rahKVM"            > strings/0x409/manufacturer
+echo "rahKVM MacForward" > strings/0x409/product
 
 # --- Configuration ---
 mkdir -p configs/c.1/strings/0x409

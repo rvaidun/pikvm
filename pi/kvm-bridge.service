@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM web bridge (WS -> /dev/hidg*)
+Description=rahKVM web bridge (WS -> /dev/hidg*)
 After=network-online.target kvm-gadget.service
 Wants=network-online.target
 Requires=kvm-gadget.service

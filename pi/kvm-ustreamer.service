@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM HDMI capture (TC358743 CSI -> ustreamer :8080)
+Description=rahKVM HDMI capture (TC358743 CSI -> ustreamer :8080)
 After=network-online.target
 Wants=network-online.target
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-shot installer for briKVM MacForward on Raspberry Pi Zero 2 W.
+# One-shot installer for rahKVM MacForward on Raspberry Pi Zero 2 W.
 #
 # Prereqs:
 #   - Fresh install of Raspberry Pi OS Lite (64-bit, Bookworm or newer)
@@ -28,7 +28,7 @@ echo "==> 1. Enable USB OTG"
 CONFIG=/boot/firmware/config.txt
 if ! grep -q "^dtoverlay=dwc2" "$CONFIG"; then
   echo "" >> "$CONFIG"
-  echo "# briKVM MacForward" >> "$CONFIG"
+  echo "# rahKVM MacForward" >> "$CONFIG"
   echo "dtoverlay=dwc2" >> "$CONFIG"
 fi
 
@@ -83,7 +83,7 @@ systemctl enable macforward-receiver.service
 echo
 echo "==> 6. Install complete."
 echo "    Reboot now (sudo reboot), then plug the Pi Zero's USB (data) port"
-echo "    into the Windows target. Windows should see a 'briKVM MacForward'"
+echo "    into the Windows target. Windows should see a 'rahKVM MacForward'"
 echo "    camera + microphone appear."
 echo
 echo "    From the Mac, run:   ./mac/forward.sh <pi-zero-host-or-ip>"

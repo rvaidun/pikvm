@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-shot installer for the Pi 4 half of briKVM.
+# One-shot installer for the Pi 4 half of rahKVM.
 #
 # Prerequisites:
 #   - Raspberry Pi 4 running 64-bit Raspberry Pi OS (Bookworm+) or Ubuntu
@@ -43,14 +43,14 @@ elif grep -qE '^dtoverlay=dwc2$' "$CONFIG_TXT"; then
   sed -i 's/^dtoverlay=dwc2$/dtoverlay=dwc2,dr_mode=peripheral/' "$CONFIG_TXT"
 else
   echo "Adding dtoverlay=dwc2,dr_mode=peripheral to $CONFIG_TXT"
-  printf '\n[all]\n# briKVM: USB-C in gadget mode via PiKVM splitter\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$CONFIG_TXT"
+  printf '\n[all]\n# rahKVM: USB-C in gadget mode via PiKVM splitter\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$CONFIG_TXT"
 fi
 
 # --- 1b. HDMI-to-CSI bridge (TC358743) --------------------------------------
 # Not auto-detected by camera_auto_detect (no EEPROM), so load it explicitly.
 if ! grep -qE '^dtoverlay=tc358743' "$CONFIG_TXT"; then
   echo "Adding dtoverlay=tc358743 to $CONFIG_TXT"
-  printf '\n[all]\n# briKVM: HDMI-to-CSI bridge\ndtoverlay=tc358743\n' >> "$CONFIG_TXT"
+  printf '\n[all]\n# rahKVM: HDMI-to-CSI bridge\ndtoverlay=tc358743\n' >> "$CONFIG_TXT"
 fi
 
 # --- 2. Module autoload ------------------------------------------------------

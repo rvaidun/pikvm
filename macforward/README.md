@@ -1,4 +1,4 @@
-# briKVM MacForward
+# rahKVM MacForward
 
 Forward the Mac's webcam + microphone to a Windows PC via a Raspberry Pi Zero 2 W
 acting as a USB gadget. Windows sees a plug-and-play **USB Camera** + **USB
@@ -14,7 +14,7 @@ Pi Zero 2 W
    │  USB-C data cable (Pi Zero's "USB" port, NOT "PWR IN")
    ▼
 Windows PC
-   └─ sees "briKVM MacForward" camera + microphone
+   └─ sees "rahKVM MacForward" camera + microphone
 ```
 
 ## Hardware
@@ -31,7 +31,7 @@ Windows PC
 3. `cd pikvm/macforward/pi-zero && sudo bash install.sh`
 4. `sudo reboot`
 5. Plug the Pi Zero's `USB` micro-USB (not `PWR IN`) into the Windows target
-6. Windows should enumerate "briKVM MacForward" camera + mic
+6. Windows should enumerate "rahKVM MacForward" camera + mic
 
 ### On the Mac
 Nothing to install — ffmpeg is the only dep. If you don't have it: `brew install ffmpeg`.

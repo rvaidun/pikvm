@@ -1,4 +1,4 @@
-# briKVM
+# rahKVM
 
 A DIY IP-KVM built on a Raspberry Pi 4. One USB-C cable from the Pi to the
 target PC carries a keyboard, a mouse, a webcam and a microphone, and an

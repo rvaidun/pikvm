@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM MacForward: ffmpeg receiver (UDP -> loopback + ALSA)
+Description=rahKVM MacForward: ffmpeg receiver (UDP -> loopback + ALSA)
 After=macforward-gadget.service macforward-uvc.service
 Requires=macforward-gadget.service
 
