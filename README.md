@@ -150,6 +150,18 @@ on the Pi. Note that the gadget only advertises 1280×720.
 
 Logs: `journalctl -fu kvm-<name>`.
 
+### Comparing the camera drivers
+
+`uvc-mode.sh` swaps the UVC gadget module so you can see what the patch fixes
+(the target sees a USB replug; a reboot goes back to `bulk`):
+
+```sh
+sudo /opt/kvm/uvc-mode.sh          # show the current mode
+sudo /opt/kvm/uvc-mode.sh stock    # kernel's own module: RGB garbage
+sudo /opt/kvm/uvc-mode.sh isoc     # patched, isochronous: frames cut off, green below
+sudo /opt/kvm/uvc-mode.sh bulk     # patched, bulk: clean (the default)
+```
+
 ### Configuration files
 
 | File | Overrides |
@@ -297,6 +309,7 @@ pi/                    Raspberry Pi 4 KVM (this README)
   bridge.py            web UI + WebSocket → HID
   receiver.py          Mac stream → UVC camera driver + UAC2 mic
   hdmi-capture.sh      EDID + ustreamer launcher
+  uvc-mode.sh          switch between the stock and patched camera drivers
   kernel/usb_f_uvc/    patch + build script for the bulk-capable UVC gadget module
   edid/1080p50.hex     EDID for the TC358743
   static/index.html    browser UI

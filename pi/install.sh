@@ -95,6 +95,7 @@ install -o root -g root -m 0755 "$SRC_DIR/setup-gadget.sh" /opt/kvm/setup-gadget
 install -o root -g root -m 0755 "$SRC_DIR/bridge.py"       /opt/kvm/bridge.py
 install -o root -g root -m 0755 "$SRC_DIR/receiver.py"     /opt/kvm/receiver.py
 install -o root -g root -m 0755 "$SRC_DIR/hdmi-capture.sh" /opt/kvm/hdmi-capture.sh
+install -o root -g root -m 0755 "$SRC_DIR/uvc-mode.sh"     /opt/kvm/uvc-mode.sh
 rm -f /opt/kvm/receiver.sh   # replaced by receiver.py
 install -d -o root -g root -m 0755 /opt/kvm/edid
 install -o root -g root -m 0644 "$SRC_DIR/edid/1080p50.hex" /opt/kvm/edid/1080p50.hex

@@ -61,6 +61,12 @@ if [ -d "$GADGET_DIR" ]; then
   )
   rmdir "$GADGET_DIR"
 fi
+# `setup-gadget.sh teardown` stops here, so the function modules can be
+# unloaded and swapped (uvc-mode.sh).
+if [ "${1:-}" = "teardown" ]; then
+  echo "briKVM gadget removed"
+  exit 0
+fi
 
 cd /sys/kernel/config/usb_gadget
 mkdir -p "$GADGET_NAME" && cd "$GADGET_NAME"
