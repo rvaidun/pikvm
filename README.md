@@ -1,38 +1,20 @@
-# rahKVM
+# pikvm
 
-A DIY IP-KVM built on a Raspberry Pi 4. One USB-C cable from the Pi to the
-target PC carries a keyboard, a mouse, a webcam and a microphone, and an
-HDMI-to-CSI bridge captures the target's screen. You drive the target from a
-browser, and you can forward your Mac's webcam and mic so the target sees
-them as a plug-and-play USB conferencing device.
+DIY PI KVM heavily inspired by [https://pikvm.org/](https://pikvm.org/)
 
-```
-                       ┌──────────────────────── Raspberry Pi 4 ─────────────────────────┐
- Target HDMI out ────► │ TC358743 (CSI) ─► ustreamer :8080 ──────────────┐               │
-                       │                                                 ▼               │
- Browser ◄───────────► │ bridge.py :8082 (web UI + WebSocket) ─► /dev/hidg0 (keyboard)   │
-                       │                                      └► /dev/hidg1 (mouse)      │──► USB-C ──► Target PC
- Mac webcam + mic ───► │ receiver.py udp:1234 ─► UVC gadget (camera, USB bulk)           │   (via PiKVM   sees "Logitech MeetUp":
-  (forward.sh)         │                      └► ALSA UAC2Gadget (microphone)            │    splitter)   kbd + mouse + cam + mic
-                       └─────────────────────────────────────────────────────────────────┘
-```
-
-The USB gadget identifies itself as a **Logitech MeetUp (046D:086B)**, a real
-conferencing device that natively ships a camera, mic and HID remote on one
-cable, so the composite device looks ordinary to the target OS.
-
----
+One USB-C cable from the Pi to the target PC carries a keyboard, a mouse, a webcam and a microphone, and an HDMI-to-CSI bridge captures the target's screen. You drive the target from a browser, and you can forward your Mac's webcam and mic so the target sees them as a regular USB  device.
 
 ## Hardware
 
+
+I strongly recommend reading the [official PiKVM DIY guide](https://pikvm.org/diy/). This setup is largely based on that guide.
+
 | Part | Notes |
 |---|---|
-| Raspberry Pi 4 (2 GB+) | The USB-C port is the only port that can act as a USB *device*. |
-| PiKVM USB-C power/data splitter | Plugs into the Pi's USB-C port. Power goes in one side, data goes to the target from the other. |
-| 5 V / 3 A USB-C power supply | Goes into the splitter's **PWR** port. |
-| **Data-capable** USB cable, splitter → target | Goes from the splitter's **USB/data** port to the target PC. Many USB-A↔C cables are charge-only and will power things but never enumerate. If the target never chimes, swap the cable first. A USB-C↔USB-C cable is known to work. |
-| HDMI-to-CSI bridge (TC358743, e.g. the C779/B101 boards) | Ribbon cable into the Pi's CAMERA connector. Target HDMI out → bridge HDMI in. |
-| microSD card | Ubuntu Server 26.04 for Raspberry Pi (tested) or 64-bit Raspberry Pi OS Bookworm+. |
+| **PiKVM USB-C power/data splitter** | Plugs into the Pi's USB-C port. Power goes into one side, and data goes to the target PC through the other. <ul><li>[Official PiKVM USB Power/Data Splitter](https://www.pishop.us/product/pikvm-usb-power-data-splitter/)</li><li>[Generic Amazon alternative](https://www.amazon.com/dp/B0DNS52HXZ)</li></ul> |
+| **Data-capable USB cable** | Connects the splitter's **USB/data** port to the target PC. Make sure the cable supports data transfer, not just charging. |
+| **HDMI-to-CSI bridge** | Examples include the C779/B101 boards. Connects to the Pi's **CAMERA** connector using a ribbon cable. The target PC's HDMI output connects to the bridge's HDMI input. [Amazon link](https://www.amazon.com/dp/B08TR7R6RL). |
+| **USB HDMI capture card (alternative)** | Instead of an HDMI-to-CSI bridge, you can use a [USB HDMI capture card](https://www.amazon.com/dp/B097QX7726). However, I found that the output in the web UI was fairly low resolution. This might have been because I used a cheap capture card. |
 
 ### Wiring
 
@@ -42,34 +24,10 @@ cable, so the composite device looks ordinary to the target OS.
 4. Plug the power supply into the splitter's **PWR** port.
 5. Run a data cable from the splitter's **USB/data** port to the target PC.
 
----
-
 ## Pi setup
+Assuming you have this repo cloned in your pi
 
-### 1. Flash and boot
-
-Flash Ubuntu Server for Raspberry Pi (or Raspberry Pi OS 64-bit) with Raspberry
-Pi Imager. In the imager settings, set the hostname, your user (the services
-assume `rahul`; see `BRIDGE_USER` below), Wi-Fi/Ethernet and an SSH key. Boot
-and SSH in:
-
-```sh
-ssh rahul@<pi-ip>
 ```
-
-### 2. Give the Pi access to this (private) repo
-
-```sh
-ssh-keygen -t ed25519           # if ~/.ssh/id_ed25519 doesn't exist yet
-cat ~/.ssh/id_ed25519.pub       # add at github.com → Settings → SSH keys
-ssh -T git@github.com           # should greet you by username
-```
-
-### 3. Clone and install
-
-```sh
-git clone git@github.com:rvaidun/pikvm.git ~/pikvm
-cd ~/pikvm/pi
 sudo bash install.sh            # BRIDGE_USER=<you> sudo -E bash install.sh for a different user
 sudo reboot
 ```
