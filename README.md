@@ -26,7 +26,7 @@ I strongly recommend reading the [official PiKVM DIY guide](https://pikvm.org/di
 
 ### Case
 
-`case/kvm-case.scad` is a parametric OpenSCAD enclosure for the Pi 4 and the Waveshare HDMI-to-CSI adapter. `case/kvm-case-base.stl` and `case/kvm-case-lid.stl` are exported with the defaults. The adapter sits in a cradle behind the Pi's GPIO edge, with its HDMI input through the back wall. It needs no screws. The Pi sits on pegs through its mounting holes, posts on the lid hold both boards down, and the lid snaps on with four clips. To open it, push the clip hooks in through the slots in the front and back walls. To re-export:
+`case/kvm-case.scad` is a parametric OpenSCAD enclosure for the Pi 4 and the Waveshare HDMI-to-CSI adapter. `case/kvm-case-base.stl` and `case/kvm-case-lid.stl` are exported with the defaults. The adapter sits in a cradle behind the Pi's GPIO edge, with its HDMI input through the back wall. It needs no screws. The Pi sits on pegs through its mounting holes, and posts on the lid hold both boards down. Like the official Pi case, the lid clicks on and pulls off by hand: four springy clips have bumps that sit in shallow grooves inside the walls. To re-export:
 
 ```sh
 openscad -D 'part="base"' -o case/kvm-case-base.stl case/kvm-case.scad

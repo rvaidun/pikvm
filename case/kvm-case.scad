@@ -22,9 +22,9 @@
 // exported). `part = "assembly"` is a preview only.
 //
 // No screws. The Pi sits on pegs through its mounting holes and the adapter
-// in a cradle; posts on the lid hold both down. The lid snaps on with four
-// clips (two front, two back). To open it, push the clip hooks in through
-// the slots in the walls.
+// in a cradle; posts on the lid hold both down. The lid clicks on like the
+// official Pi case: four springy tongues with bumps ramped on both sides sit
+// in shallow grooves inside the walls, so a firm pull takes it off again.
 //
 // The adapter outline (about 42 x 26 mm) was measured by hand.
 
@@ -70,8 +70,9 @@ ad_hdmi_overhang = 0.5; // how far the HDMI shell sticks past the board edge
 snap_w      = 10;    // clip width
 snap_t      = 1.2;   // clip thickness; thicker is stiffer but more likely to crack
 snap_len    = 10;    // how far the clip hangs below the lid
-snap_hook   = 0.9;   // hook depth; the hook goes snap_hook - snap_gap into the wall
-snap_hook_h = 2.5;   // hook height (flat top catches the slot)
+snap_hook   = 0.9;   // bump depth; it sits snap_hook - snap_gap into the wall groove.
+                     // More = holds tighter, harder to pull off.
+snap_hook_h = 2.8;   // bump height (ramps on both sides)
 snap_gap    = 0.3;   // clip to wall clearance
 snap_front_x = [30, 75];  // clip positions along the front wall (Pi coordinates)
 snap_back_x  = [10, 80];  // and along the back wall, clear of the HDMI opening
@@ -129,14 +130,17 @@ module snap_positions() {
 }
 
 // One clip in lid coordinates (z = 0 is the lid underside): a flexible tongue
-// with a ramped hook on the wall side.
+// with a bump on the wall side, ramped top and bottom so it pushes in and
+// pulls out.
 module snap_clip() {
+    ramp = snap_hook * 1.2;
     translate([-snap_w / 2, snap_gap, -snap_len]) {
         cube([snap_w, snap_t, snap_len + eps]);
         hull() {
             cube([snap_w, eps, eps]);
-            translate([0, -snap_hook, snap_hook * 1.2])
-                cube([snap_w, snap_hook, snap_hook_h - snap_hook * 1.2]);
+            translate([0, -snap_hook, ramp])
+                cube([snap_w, snap_hook, snap_hook_h - 2 * ramp]);
+            translate([0, 0, snap_hook_h]) cube([snap_w, eps, eps]);
         }
     }
 }
@@ -191,10 +195,11 @@ module base() {
                        in_y1 - 1, ad_top - 0.75])
                 cube([ad_hdmi_w + 1.5, wall + 2, ad_hdmi_h + 1.5]);
 
-            // Slots the lid clips snap into
-            snap_positions() translate([-(snap_w + 1) / 2, -wall - 1,
-                                        floor_t + inner_h - snap_len - 0.5])
-                cube([snap_w + 1, wall + 1 + eps, snap_hook_h + 0.5 + 0.2]);
+            // Shallow grooves inside the walls that the lid's bumps click into
+            snap_positions() translate([-(snap_w + 1) / 2,
+                                        -(snap_hook - snap_gap + 0.2),
+                                        floor_t + inner_h - snap_len - 0.3])
+                cube([snap_w + 1, snap_hook - snap_gap + 0.2 + eps, snap_hook_h + 0.6]);
 
             // Left wall vents
             if (side_vents) for (i = [0 : 4])
