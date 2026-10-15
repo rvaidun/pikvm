@@ -94,7 +94,7 @@ curl -s localhost:8080/state          # ustreamer: "online": true and the HDMI r
 ```
 
 On the target, Windows should chime and Device Manager should list a
-**MeetUp** camera, a microphone, and a HID keyboard and mouse.
+**Logitech MeetUp** camera and microphone, plus a HID keyboard and mouse.
 
 ---
 
@@ -119,7 +119,7 @@ cd ~/GitProjects/pikvm/macforward/mac
 ./forward.sh <pi-ip>              # e.g. ./forward.sh 192.168.1.8, Ctrl-C to stop
 ```
 
-On the target, open the Camera app, or select **MeetUp** as the camera and mic
+On the target, open the Camera app, or select **Logitech MeetUp** as the camera and mic
 in Zoom or Teams. You'll see the Mac's camera within a second or two of
 `forward.sh` starting. While the Mac isn't streaming, the camera shows black
 and the mic is silent; the device stays connected either way.
@@ -153,7 +153,7 @@ Logs: `journalctl -fu kvm-<name>`.
 
 | File | Overrides |
 |---|---|
-| `/etc/kvm-gadget.env` | `VENDOR_ID`, `PRODUCT_ID`, `MANUFACTURER`, `PRODUCT`, `SERIAL` (USB identity) |
+| `/etc/kvm-gadget.env` | `VENDOR_ID`, `PRODUCT_ID`, `MANUFACTURER`, `PRODUCT`, `SERIAL` (USB identity); `CAMERA_NAME`, `MIC_NAME` (what Windows calls the camera and mic, default "Logitech MeetUp") |
 | `/etc/kvm-receiver.env` | `PORT`, `WIDTH`, `HEIGHT`, `FPS`, `MJPEG_QUALITY`, `UAC2_CARD` |
 | `/etc/kvm-ustreamer.env` | `EDID`, `LISTEN_HOST`, `LISTEN_PORT`, `QUALITY` |
 

@@ -27,6 +27,10 @@ VENDOR_ID="${VENDOR_ID:-0x046D}"
 PRODUCT_ID="${PRODUCT_ID:-0x086B}"
 MANUFACTURER="${MANUFACTURER:-Logitech}"
 PRODUCT="${PRODUCT:-MeetUp}"
+# Windows names the camera and mic from each function's own interface
+# string, not the device's product string, so these need spoofing too.
+CAMERA_NAME="${CAMERA_NAME:-$MANUFACTURER $PRODUCT}"
+MIC_NAME="${MIC_NAME:-$MANUFACTURER $PRODUCT}"
 # Use the Pi's own CPU serial so the target OS treats us as the same
 # device across reboots (realistic). Fall back to a stable fake if unreadable.
 SERIAL="${SERIAL:-$(awk -F: '/Serial/ {gsub(/ /,"",$2); print $2}' /proc/cpuinfo 2>/dev/null || true)}"
@@ -114,6 +118,7 @@ echo -ne '\x05\x01\x09\x02\xA1\x01\x09\x01\xA1\x00\x05\x09\x19\x01\x29\x03\x15\x
 
 # --- UVC function (1280x720 MJPG @ 30fps) -----------------------------------
 mkdir -p functions/uvc.usb0/control/header/h
+echo "$CAMERA_NAME" > functions/uvc.usb0/function_name
 cd functions/uvc.usb0/control
 ln -s header/h class/fs
 ln -s header/h class/ss
@@ -146,11 +151,16 @@ echo 2     > functions/uac2.usb0/c_chmask    # stereo capture
 echo 48000 > functions/uac2.usb0/c_srate
 echo 2     > functions/uac2.usb0/c_ssize     # 16-bit
 echo 0     > functions/uac2.usb0/p_chmask    # no playback (host->Pi)
+echo "$MIC_NAME" > functions/uac2.usb0/function_name
 
 # --- Wire functions into the configuration ---------------------------------
+# Link order sets interface numbers. UVC must come first (interfaces 0/1):
+# the kernel renumbers UVC requests to 0/1 for userspace, and uvc-gadget
+# matches them against the real configfs numbers, so anywhere else it
+# ignores every probe request and the host can never start the camera.
+ln -s functions/uvc.usb0  configs/c.1/
 ln -s functions/hid.usb0  configs/c.1/
 ln -s functions/hid.usb1  configs/c.1/
-ln -s functions/uvc.usb0  configs/c.1/
 ln -s functions/uac2.usb0 configs/c.1/
 
 # --- Bind to the Pi 4 USB-C UDC ---------------------------------------------
