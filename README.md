@@ -24,6 +24,15 @@ I strongly recommend reading the [official PiKVM DIY guide](https://pikvm.org/di
 4. Plug the power supply into the splitter's **PWR** port.
 5. Run a data cable from the splitter's **USB/data** port to the target PC.
 
+### Case
+
+`case/kvm-case.scad` is a parametric OpenSCAD enclosure for the Pi 4 and the Waveshare HDMI-to-CSI adapter. `case/kvm-case-base.stl` and `case/kvm-case-lid.stl` are exported with the defaults. The adapter sits in a cradle behind the Pi's GPIO edge, with its HDMI input through the back wall. Four M2.5 x 12 screws go up through the floor and the Pi into posts on the lid, so the same screws hold the Pi and the lid. Measure your adapter before printing, because its HDMI position and size come from a retailer listing (see the parameters at the top of the file). To re-export:
+
+```sh
+openscad -D 'part="base"' -o case/kvm-case-base.stl case/kvm-case.scad
+openscad -D 'part="lid"'  -o case/kvm-case-lid.stl  case/kvm-case.scad
+```
+
 ## Pi setup
 Assuming you have this repo cloned in your pi
 
