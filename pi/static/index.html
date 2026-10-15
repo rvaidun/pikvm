@@ -135,13 +135,29 @@ function onKey(e, down) {
   const code = HID[e.code];
   if (code == null) return;
   e.preventDefault();
+  // Left Command is held back until another key goes down with it. macOS
+  // eats Cmd+Tab, so the target would otherwise see Win pressed and released
+  // alone (on the release-all as focus leaves) and open the Start menu. A
+  // lone Cmd tap therefore does nothing; Ctrl+Esc opens Start.
+  if (e.code === 'MetaLeft') {
+    if (down) { metaHeld = true; return; }
+    metaHeld = false;
+    if (!metaSent) return;
+    metaSent = false;
+  } else if (down && metaHeld && !metaSent) {
+    send(`kd ${HID.MetaLeft}`);
+    metaSent = true;
+  }
   send(`${down ? 'kd' : 'ku'} ${code}`);
 }
+let metaHeld = false, metaSent = false;
 window.addEventListener('keydown', e => onKey(e, true));
 window.addEventListener('keyup',   e => onKey(e, false));
 
 // Browser steals Esc to unlock pointer; also release all keys on unlock.
-document.addEventListener('pointerlockchange', () => { if (!locked) send('krel'); });
+document.addEventListener('pointerlockchange', () => {
+  if (!locked) { send('krel'); metaHeld = metaSent = false; }
+});
 
 // --- Mouse ---
 const BTN = { 0: 1, 1: 4, 2: 2 };  // browser.button -> HID button bit
