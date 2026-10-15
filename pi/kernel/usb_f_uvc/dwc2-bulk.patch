@@ -1,10 +1,9 @@
 --- a/f_uvc.c
 +++ b/f_uvc.c
-@@ -32,7 +32,22 @@
- unsigned int uvc_gadget_trace_param;
+@@ -33,6 +33,21 @@
  module_param_named(trace, uvc_gadget_trace_param, uint, 0644);
  MODULE_PARM_DESC(trace, "Trace level bitmask");
-+
+ 
 +/*
 + * Bulk streaming. Isochronous IN on dwc2 without descriptor DMA (e.g. the
 + * Raspberry Pi 4) has to re-arm the endpoint from the completion interrupt
@@ -15,7 +14,7 @@
 +static bool uvc_bulk;
 +module_param_named(bulk, uvc_bulk, bool, 0444);
 +MODULE_PARM_DESC(bulk, "Stream over a bulk endpoint instead of isochronous");
- 
++
 +static unsigned int uvc_bulk_payload = 16384;
 +module_param_named(bulk_payload, uvc_bulk_payload, uint, 0444);
 +MODULE_PARM_DESC(bulk_payload, "Bulk payload (and request) size in bytes");
@@ -98,10 +97,11 @@
  	/*
  	 * Descriptors layout
  	 *
-@@ -730,6 +783,24 @@
+@@ -729,6 +782,24 @@
+ 	uvc_ss_streaming_comp.wBytesPerInterval =
  		cpu_to_le16(max_packet_size * max_packet_mult *
  			    (opts->streaming_maxburst + 1));
- 
++
 +	if (uvc_bulk) {
 +		uvc_bulk_payload = clamp(rounddown(uvc_bulk_payload, 1024),
 +					 1024U, 65536U);
@@ -119,10 +119,26 @@
 +		uvc_ss_streaming_comp.wBytesPerInterval = 0;
 +		uvc_streaming_intf_alt0.bNumEndpoints = 1;
 +	}
-+
+ 
  	/* Allocate endpoints. */
  	if (opts->enable_interrupt_ep) {
- 		ep = usb_ep_autoconfig(cdev->gadget, &uvc_interrupt_ep);
+@@ -769,6 +840,16 @@
+ 	uvc_ss_streaming_ep.bEndpointAddress = uvc->video.ep->address;
+ 
+ 	/*
++	 * usb_ep_autoconfig() assumes the descriptor it is handed is the
++	 * full-speed one and caps bulk wMaxPacketSize at 64; high speed and
++	 * SuperSpeed bulk must use 512 and 1024.
++	 */
++	if (uvc_bulk) {
++		uvc_hs_streaming_ep.wMaxPacketSize = cpu_to_le16(512);
++		uvc_ss_streaming_ep.wMaxPacketSize = cpu_to_le16(1024);
++	}
++
++	/*
+ 	 * Hold opts->lock across both the XU string-descriptor fixup below and
+ 	 * the descriptor-copy block further down.  Without this, configfs
+ 	 * uvcg_extension_drop() (which takes opts->lock) can race with the
 --- a/uvc_video.c
 +++ b/uvc_video.c
 @@ -112,7 +112,14 @@
