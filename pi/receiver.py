@@ -39,7 +39,7 @@ Env vars:
   H264_DECODER    ffmpeg decoder for the Mac stream     (default h264_v4l2m2m; h264 = software)
   AUDIO_PORT      localhost port for the PCM hop        (default 1236)
   UAC2_CARD       ALSA device for the gadget mic        (default hw:UAC2Gadget)
-  GADGET          configfs gadget name                  (default rahkvm)
+  GADGET          configfs gadget name                  (default g1)
 """
 import errno
 import fcntl
@@ -63,7 +63,7 @@ MJPEG_QUALITY = os.environ.get("MJPEG_QUALITY", "7")
 H264_DECODER = os.environ.get("H264_DECODER", "h264_v4l2m2m")
 AUDIO_PORT = int(os.environ.get("AUDIO_PORT", "1236"))
 UAC2_CARD = os.environ.get("UAC2_CARD", "hw:UAC2Gadget")
-GADGET = os.environ.get("GADGET", "rahkvm")
+GADGET = os.environ.get("GADGET", "g1")
 
 # Mac stream silent for this long -> switch to the placeholder.
 STALE_AFTER = 1.0

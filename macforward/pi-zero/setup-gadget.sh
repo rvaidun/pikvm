@@ -37,18 +37,17 @@ cd /sys/kernel/config/usb_gadget
 mkdir -p "$GADGET_NAME" && cd "$GADGET_NAME"
 
 # --- Device descriptor ---
-echo 0x1d6b > idVendor      # Linux Foundation
-echo 0x0104 > idProduct     # Multifunction composite
+echo 0x046D > idVendor      # Logitech, same identity as pi/setup-gadget.sh
+echo 0x086B > idProduct
 echo 0x0100 > bcdDevice
 echo 0x0200 > bcdUSB
 mkdir -p strings/0x409
-echo "0001"              > strings/0x409/serialnumber
-echo "rahKVM"            > strings/0x409/manufacturer
-echo "rahKVM MacForward" > strings/0x409/product
+echo "8A3F1C2D"          > strings/0x409/serialnumber
+echo "Logitech"          > strings/0x409/manufacturer
+echo "MeetUp"            > strings/0x409/product
 
 # --- Configuration ---
-mkdir -p configs/c.1/strings/0x409
-echo "UVC+UAC2 (Mac camera + mic forwarded)" > configs/c.1/strings/0x409/configuration
+mkdir -p configs/c.1
 echo 500 > configs/c.1/MaxPower
 
 # --- UVC function (1280x720 MJPG @ 30fps) ---

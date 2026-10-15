@@ -14,7 +14,7 @@
 # Runs at boot via kvm-gadget.service. Idempotent.
 set -euo pipefail
 
-GADGET_NAME="rahkvm"
+GADGET_NAME="g1"
 GADGET_DIR="/sys/kernel/config/usb_gadget/${GADGET_NAME}"
 
 # --- Spoofed device identity (override via /etc/kvm-gadget.env) -------------
@@ -31,10 +31,11 @@ PRODUCT="${PRODUCT:-MeetUp}"
 # string, not the device's product string, so these need spoofing too.
 CAMERA_NAME="${CAMERA_NAME:-$MANUFACTURER $PRODUCT}"
 MIC_NAME="${MIC_NAME:-$MANUFACTURER $PRODUCT}"
-# Use the Pi's own CPU serial so the target OS treats us as the same
-# device across reboots (realistic). Fall back to a stable fake if unreadable.
-SERIAL="${SERIAL:-$(awk -F: '/Serial/ {gsub(/ /,"",$2); print $2}' /proc/cpuinfo 2>/dev/null || true)}"
-SERIAL="${SERIAL:-00000000DEADBEEF}"
+# Derive the serial from the Pi's CPU serial so the target OS treats us as
+# the same device across reboots. Logitech serials are 8 uppercase hex
+# digits; the full Pi serial (10000000xxxxxxxx) would stand out.
+SERIAL="${SERIAL:-$(awk -F: '/Serial/ {gsub(/ /,"",$2); print toupper(substr($2, length($2)-7))}' /proc/cpuinfo 2>/dev/null || true)}"
+SERIAL="${SERIAL:-8A3F1C2D}"
 
 modprobe libcomposite
 
@@ -91,8 +92,8 @@ echo "$MANUFACTURER" > strings/0x409/manufacturer
 echo "$PRODUCT"      > strings/0x409/product
 
 # --- Configuration -----------------------------------------------------------
-mkdir -p configs/c.1/strings/0x409
-echo "rahKVM composite" > configs/c.1/strings/0x409/configuration
+# No configuration string (iConfiguration = 0), like Logitech's own cameras.
+mkdir -p configs/c.1
 echo 500                > configs/c.1/MaxPower       # mA; UVC+UAC2 want headroom
 echo 0xA0               > configs/c.1/bmAttributes   # bus-powered, remote wakeup
 
