@@ -71,7 +71,22 @@ const statusEl = document.getElementById('status');
 const hint = document.getElementById('hint');
 
 // Point <img> at ustreamer on same host (port 8080).
-video.src = `http://${location.hostname}:8080/stream`;
+const STREAM_HOST = `http://${location.hostname}:8080`;
+function loadVideo() { video.src = `${STREAM_HOST}/stream?t=${Date.now()}`; }
+video.onerror = () => setTimeout(loadVideo, 1000);
+loadVideo();
+// When ustreamer restarts (kvm-ustreamer restart re-detects the display), the
+// MJPEG connection just ends: no error event, the last frame stays up. Poll
+// it and reconnect once it's back after being unreachable.
+let streamDown = false;
+setInterval(async () => {
+  try {
+    await fetch(`${STREAM_HOST}/state`, { mode: 'no-cors', cache: 'no-store' });
+    if (streamDown) { streamDown = false; loadVideo(); }
+  } catch {
+    streamDown = true;
+  }
+}, 1000);
 
 // --- WebSocket ---
 let ws = null;
