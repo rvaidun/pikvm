@@ -232,10 +232,16 @@ def read_raw(stream, size: int, store: FrameStore):
         store.push(bytes(frame))
 
 
+# swscale's default bicubic costs ~1.5x fast_bilinear here; at webcam sizes
+# the difference isn't visible.
+SWS_FLAGS = "fast_bilinear"
+
+
 def fit(mode: Mode) -> str:
     """Scale filter that letterboxes the 16:9 Mac picture into the mode's frame."""
-    return (f"scale={mode.width}:{mode.height}:force_original_aspect_ratio=decrease,"
-            f"pad={mode.width}:{mode.height}:(ow-iw)/2:(oh-ih)/2")
+    return (f"scale={mode.width}:{mode.height}:force_original_aspect_ratio=decrease"
+            f":flags={SWS_FLAGS},pad={mode.width}:{mode.height}:(ow-iw)/2:(oh-ih)/2,"
+            f"scale=flags={SWS_FLAGS}")
 
 
 class Decoder:
@@ -255,7 +261,11 @@ class Decoder:
     @staticmethod
     def command(outputs: list[tuple[Mode, int]]) -> list[str]:
         """ffmpeg arguments writing each (mode, pipe fd) pair's frames to its fd."""
-        graph = [f"[0:v]split={len(outputs)}" + "".join(f"[s{i}]" for i in range(len(outputs)))]
+        # h264_v4l2m2m's frames live in the V4L2 capture buffers, which are
+        # slow to read (uncached); swscale reads each line several times and
+        # ran ~3x slower on them than on the software decoder's frames. One
+        # sequential copy to ordinary memory first halves ffmpeg's CPU.
+        graph = [f"[0:v]copy,split={len(outputs)}" + "".join(f"[s{i}]" for i in range(len(outputs)))]
         args = []
         for i, (mode, fd) in enumerate(outputs):
             if mode.raw:
