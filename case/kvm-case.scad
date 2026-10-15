@@ -26,9 +26,8 @@
 // screws clamp the Pi and hold the lid on. Optional: 4x M2.5 screws for the
 // adapter if adapter_mount = "screws".
 //
-// MEASURE YOUR ADAPTER before printing. The board outline (45 x 30 mm) is from
-// a retailer listing; the hole positions, HDMI position and ribbon-connector
-// side are best guesses. The "cradle" mount doesn't depend on the hole
+// The board outline (about 42 x 26 mm) was measured by hand; the hole
+// positions, HDMI position and ribbon-connector side are best guesses. The "cradle" mount doesn't depend on the hole
 // positions, which is why it is the default.
 
 /* [What to render] */
@@ -58,8 +57,8 @@ cut_micro_hdmi = false; // the KVM doesn't use the Pi's own HDMI outputs
 cut_audio      = false;
 
 /* [Waveshare HDMI-to-CSI adapter] */
-ad_w        = 30;    // size across the case (x)
-ad_d        = 45;    // size front-to-back (y), HDMI on the back edge
+ad_w        = 26.2;  // size across the case (x), measured ~25-26 mm
+ad_d        = 42.2;  // size front-to-back (y), HDMI on the back edge, measured ~41-42 mm
 ad_pcb      = 1.6;
 ad_gap      = 6;     // space between the Pi's GPIO edge and the adapter (ribbon bend)
 ad_center_x = 45;    // in Pi coordinates; 45 lines the ribbon up with the CAMERA connector
