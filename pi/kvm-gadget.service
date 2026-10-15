@@ -1,5 +1,5 @@
 [Unit]
-Description=briKVM USB HID gadget (keyboard + mouse)
+Description=briKVM USB composite gadget (keyboard + mouse + camera + mic)
 # Must run before anything that writes /dev/hidg*.
 Before=kvm-bridge.service
 # ConfigFS has to be mounted first (it is on Raspberry Pi OS by default,

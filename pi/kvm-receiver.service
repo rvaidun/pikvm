@@ -1,9 +1,9 @@
 [Unit]
-Description=briKVM receiver (Mac UDP -> v4l2loopback + ALSA UAC2Gadget)
+Description=briKVM receiver (Mac UDP -> v4l2loopback MJPEG + ALSA UAC2Gadget)
 After=kvm-gadget.service kvm-uvc.service network-online.target
 Requires=kvm-gadget.service
 Wants=network-online.target
-ConditionPathExists=/dev/video10
+ConditionPathExists=/dev/video50
 
 [Service]
 Type=simple

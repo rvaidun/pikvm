@@ -2,16 +2,16 @@
 # One-shot installer for the Pi 4 half of briKVM.
 #
 # Prerequisites:
-#   - Raspberry Pi 4 running Raspberry Pi OS (Bookworm 64-bit or newer).
+#   - Raspberry Pi 4 running 64-bit Raspberry Pi OS (Bookworm+) or Ubuntu
+#     Server for Raspberry Pi (tested on Ubuntu 26.04, kernel 7.0 raspi).
 #   - PiKVM USB-C splitter wired so the Pi's USB-C carries data to the
 #     target PC and the splitter's barrel jack supplies power.
-#   - An HDMI capture source (CSI bridge recommended, USB dongle OK).
 #
 # What it does:
 #   1. Enables the dwc2 USB OTG controller in peripheral mode.
-#   2. Autoloads dwc2 + libcomposite at boot.
-#   3. Installs ffmpeg + v4l2loopback + build deps.
-#   4. Builds and installs uvc-gadget from freedesktop.org.
+#   2. Autoloads dwc2 + libcomposite at boot; pins v4l2loopback to /dev/video50.
+#   3. Installs ffmpeg + v4l2loopback (DKMS, needs kernel headers) + build deps.
+#   4. Builds and installs uvc-gadget (+ libuvcgadget) from freedesktop.org.
 #   5. Copies bridge.py, setup-gadget.sh, receiver.sh, uvc-handler.sh to /opt/kvm/.
 #   6. Installs udev rule and all four systemd units, enables them.
 #   7. Installs aiohttp (apt pkg) for the WebSocket bridge.
@@ -32,11 +32,24 @@ if [ ! -f "$CONFIG_TXT" ]; then
 fi
 
 # --- 1. dwc2 in peripheral mode ---------------------------------------------
-if ! grep -qE '^dtoverlay=dwc2' "$CONFIG_TXT"; then
-  echo "Adding dtoverlay=dwc2,dr_mode=peripheral to $CONFIG_TXT"
-  printf '\n# briKVM: USB-C in gadget mode via PiKVM splitter\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$CONFIG_TXT"
+# A bare `dtoverlay=dwc2` (what Ubuntu's raspi config.txt ships) means OTG,
+# which can leave the Pi 4's USB-C port acting as a host. Force peripheral.
+# The [cm4] section's `dtoverlay=dwc2,dr_mode=host` doesn't match and is left alone.
+if grep -qE '^dtoverlay=dwc2,dr_mode=peripheral' "$CONFIG_TXT"; then
+  echo "dwc2 peripheral overlay already present in $CONFIG_TXT"
+elif grep -qE '^dtoverlay=dwc2$' "$CONFIG_TXT"; then
+  echo "Switching bare dtoverlay=dwc2 to dr_mode=peripheral in $CONFIG_TXT"
+  sed -i 's/^dtoverlay=dwc2$/dtoverlay=dwc2,dr_mode=peripheral/' "$CONFIG_TXT"
 else
-  echo "dwc2 overlay already present in $CONFIG_TXT (leaving alone)"
+  echo "Adding dtoverlay=dwc2,dr_mode=peripheral to $CONFIG_TXT"
+  printf '\n[all]\n# briKVM: USB-C in gadget mode via PiKVM splitter\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$CONFIG_TXT"
+fi
+
+# --- 1b. HDMI-to-CSI bridge (TC358743) --------------------------------------
+# Not auto-detected by camera_auto_detect (no EEPROM), so load it explicitly.
+if ! grep -qE '^dtoverlay=tc358743' "$CONFIG_TXT"; then
+  echo "Adding dtoverlay=tc358743 to $CONFIG_TXT"
+  printf '\n[all]\n# briKVM: HDMI-to-CSI bridge\ndtoverlay=tc358743\n' >> "$CONFIG_TXT"
 fi
 
 # --- 2. Module autoload ------------------------------------------------------
@@ -45,27 +58,42 @@ dwc2
 libcomposite
 EOF
 
+# /dev/video10-31 belong to the Pi 4's hardware codec/ISP, so park the
+# loopback at /dev/video50 no matter who loads the module.
+cat > /etc/modprobe.d/kvm-v4l2loopback.conf <<'EOF'
+options v4l2loopback video_nr=50 card_label=briKVM-Loopback exclusive_caps=1
+EOF
+
 # --- 3. apt deps (ffmpeg, v4l2loopback, build tooling for uvc-gadget) -------
+# v4l2loopback is built by DKMS, so the running kernel's headers must exist.
+# Ubuntu raspi: linux-headers-$(uname -r). Raspberry Pi OS: linux-headers-rpi-v8.
+HEADERS_PKG="linux-headers-$(uname -r)"
+apt-cache show "$HEADERS_PKG" >/dev/null 2>&1 || HEADERS_PKG="linux-headers-rpi-v8"
 apt-get update
 apt-get install -y \
+  "$HEADERS_PKG" \
   python3-aiohttp \
+  ustreamer edid-decode \
   ffmpeg \
   v4l-utils v4l2loopback-dkms \
   libasound2-dev \
   build-essential git pkg-config meson ninja-build
 
-# --- 4. Build uvc-gadget from source (not packaged in Debian) ---------------
+# --- 4. Build uvc-gadget from source (not packaged in Debian/Ubuntu) -------
+# `meson install` puts the binary in /usr/local/bin and its shared
+# libuvcgadget in /usr/local/lib, hence the ldconfig.
 if [ ! -x /usr/local/bin/uvc-gadget ]; then
-  TMPDIR=$(mktemp -d)
-  trap "rm -rf $TMPDIR" EXIT
-  git clone --depth 1 https://gitlab.freedesktop.org/camera/uvc-gadget.git "$TMPDIR/uvc-gadget"
-  cd "$TMPDIR/uvc-gadget"
-  meson setup build
-  meson compile -C build
-  install -m 0755 build/uvc-gadget /usr/local/bin/uvc-gadget
-  cd - >/dev/null
+  BUILD_DIR=$(mktemp -d)
+  trap "rm -rf $BUILD_DIR" EXIT
+  git clone --depth 1 https://gitlab.freedesktop.org/camera/uvc-gadget.git "$BUILD_DIR/uvc-gadget"
+  meson setup --prefix=/usr/local "$BUILD_DIR/uvc-gadget/build" "$BUILD_DIR/uvc-gadget"
+  meson install -C "$BUILD_DIR/uvc-gadget/build"
+  ldconfig
 fi
-echo "uvc-gadget: $(/usr/local/bin/uvc-gadget --version 2>/dev/null || echo installed)"
+echo "uvc-gadget installed at /usr/local/bin/uvc-gadget"
+
+# Fail loudly now rather than at first boot if the DKMS build didn't work.
+modprobe v4l2loopback || echo "WARNING: v4l2loopback failed to load; check 'dkms status'" >&2
 
 # --- 5. Deploy code ---------------------------------------------------------
 install -d -o root -g root -m 0755 /opt/kvm
@@ -120,12 +148,13 @@ systemctl enable \
 
 cat <<EOF
 
-Install complete. Reboot to pick up the dwc2 overlay:
+Install complete. Reboot to pick up the dwc2 peripheral overlay:
 
   sudo reboot
 
 After reboot, verify:
-  ls -l /dev/hidg0 /dev/hidg1 /dev/video0 /dev/video10
+  ls -l /dev/hidg0 /dev/hidg1 /dev/video50
+  cat /sys/class/udc/*/state     # "configured" once the target enumerates the Pi
   aplay -L | grep UAC2Gadget
   systemctl status kvm-gadget kvm-bridge kvm-uvc kvm-receiver
   journalctl -fu kvm-bridge
@@ -134,5 +163,5 @@ Then:
   1. Open http://<pi-ip>:8082/ in a browser and click the video.
   2. From the Mac, point the forwarder at this Pi:
        cd .../pikvm/macforward/mac && ./forward.sh <pi-ip>
-     Windows should enumerate a camera + microphone on the composite device.
+     The target should see a "Logitech MeetUp" camera + microphone.
 EOF

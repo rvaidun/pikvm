@@ -1,13 +1,12 @@
 [Unit]
-Description=briKVM UVC gadget daemon (/dev/video10 -> USB UVC)
+Description=briKVM UVC gadget daemon (/dev/video50 -> USB UVC)
 After=kvm-gadget.service
 Requires=kvm-gadget.service
-ConditionPathExists=/dev/video0
 
 [Service]
 Type=simple
 ExecStart=/opt/kvm/uvc-handler.sh
-Restart=on-failure
+Restart=always
 RestartSec=2
 
 [Install]

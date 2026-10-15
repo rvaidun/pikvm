@@ -1,17 +1,18 @@
 #!/bin/bash
-# Runs the uvc-gadget daemon: reads frames from /dev/video10 (v4l2loopback)
-# and submits them to the gadget's /dev/video0 endpoint, which the target
-# PC sees as a webcam.
+# Runs the uvc-gadget daemon: reads MJPEG frames from the v4l2loopback
+# device (fed by receiver.sh) and submits them to the gadget's UVC function,
+# which the target PC sees as a webcam. uvc-gadget resolves the gadget-side
+# /dev/videoN from the configfs function name itself.
 set -euo pipefail
 
-for i in $(seq 1 30); do
-  [ -e /dev/video0 ] && [ -e /dev/video10 ] && break
+LOOPBACK="${LOOPBACK:-/dev/video50}"
+UVC_FUNCTION="${UVC_FUNCTION:-brikvm/functions/uvc.usb0}"
+
+# v4l2loopback runs with exclusive_caps=1, so it only advertises CAPTURE
+# once a producer (receiver.sh's ffmpeg) is writing to it. uvc-gadget
+# refuses a source that isn't a capture device, so wait for that.
+until v4l2-ctl -d "$LOOPBACK" --info 2>/dev/null | grep -q 'Video Capture'; do
   sleep 1
 done
 
-exec /usr/local/bin/uvc-gadget \
-  -u /dev/video0 \
-  -d /dev/video10 \
-  -f 1 \
-  -r 0 \
-  -n 3
+exec /usr/local/bin/uvc-gadget -d "$LOOPBACK" "$UVC_FUNCTION"

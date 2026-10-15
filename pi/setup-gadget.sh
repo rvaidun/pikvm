@@ -2,7 +2,7 @@
 # Creates a composite USB gadget on the Pi 4 that presents to the target PC as:
 #   - HID keyboard (/dev/hidg0)
 #   - HID mouse    (/dev/hidg1)
-#   - UVC camera   (/dev/video0 on the gadget side, fed by v4l2loopback /dev/video10)
+#   - UVC camera   (fed by uvc-gadget from v4l2loopback /dev/video50)
 #   - UAC2 mic     (ALSA hw:UAC2Gadget capture, fed by the receiver's ffmpeg)
 #
 # Needs:
@@ -34,29 +34,34 @@ SERIAL="${SERIAL:-00000000DEADBEEF}"
 
 modprobe libcomposite
 # v4l2loopback is the staging buffer between the Mac-stream receiver (ffmpeg)
-# and the UVC gadget. exclusive_caps=1 makes it readable by uvc-gadget as
-# a V4L2 output.
-modprobe v4l2loopback video_nr=10 card_label="briKVM-Loopback" exclusive_caps=1 || true
+# and the UVC gadget. exclusive_caps=1 makes it look like a plain capture
+# device to uvc-gadget once ffmpeg is writing. video_nr=50 because the Pi 4's
+# hardware codec/ISP already own /dev/video10-31. Options also live in
+# /etc/modprobe.d/kvm-v4l2loopback.conf so any loader gets the same node.
+modprobe v4l2loopback video_nr=50 card_label="briKVM-Loopback" exclusive_caps=1 || true
 
 # --- Teardown previous instance (idempotent) --------------------------------
+# ConfigFS only lets you remove things in reverse creation order: symlinks
+# first, then user-created dirs leaf-first. Default groups (class/fs etc.)
+# disappear with their parent.
 if [ -d "$GADGET_DIR" ]; then
-  echo "" > "${GADGET_DIR}/UDC" 2>/dev/null || true
-  rm -f "${GADGET_DIR}/configs/c.1/hid.usb0"  2>/dev/null || true
-  rm -f "${GADGET_DIR}/configs/c.1/hid.usb1"  2>/dev/null || true
-  rm -f "${GADGET_DIR}/configs/c.1/uvc.usb0"  2>/dev/null || true
-  rm -f "${GADGET_DIR}/configs/c.1/uac2.usb0" 2>/dev/null || true
-  rmdir "${GADGET_DIR}/configs/c.1/strings/0x409" 2>/dev/null || true
-  rmdir "${GADGET_DIR}/configs/c.1" 2>/dev/null || true
-  rmdir "${GADGET_DIR}/functions/hid.usb0"  2>/dev/null || true
-  rmdir "${GADGET_DIR}/functions/hid.usb1"  2>/dev/null || true
-  # UVC function has a nested tree — tear it down leaf-first.
-  rmdir "${GADGET_DIR}/functions/uvc.usb0"/streaming/mjpeg/m/*  2>/dev/null || true
-  rmdir "${GADGET_DIR}/functions/uvc.usb0"/streaming/mjpeg/m    2>/dev/null || true
-  find  "${GADGET_DIR}/functions/uvc.usb0" -type l -delete 2>/dev/null || true
-  find  "${GADGET_DIR}/functions/uvc.usb0" -depth -type d -empty -delete 2>/dev/null || true
-  rmdir "${GADGET_DIR}/functions/uac2.usb0" 2>/dev/null || true
-  rmdir "${GADGET_DIR}/strings/0x409" 2>/dev/null || true
-  rmdir "${GADGET_DIR}" 2>/dev/null || true
+  (
+    cd "$GADGET_DIR"
+    echo "" > UDC 2>/dev/null || true
+    rm -f configs/c.1/hid.usb0 configs/c.1/hid.usb1 configs/c.1/uvc.usb0 configs/c.1/uac2.usb0
+    rmdir configs/c.1/strings/0x409 configs/c.1 2>/dev/null || true
+    U=functions/uvc.usb0
+    if [ -d "$U" ]; then
+      rm -f "$U"/control/class/fs/h "$U"/control/class/ss/h
+      rm -f "$U"/streaming/class/fs/h "$U"/streaming/class/hs/h "$U"/streaming/class/ss/h
+      rm -f "$U"/streaming/header/h/m
+      rmdir "$U"/streaming/header/h "$U"/streaming/mjpeg/m/720p "$U"/streaming/mjpeg/m 2>/dev/null || true
+      rmdir "$U"/control/header/h "$U" 2>/dev/null || true
+    fi
+    rmdir functions/hid.usb0 functions/hid.usb1 functions/uac2.usb0 2>/dev/null || true
+    rmdir strings/0x409 2>/dev/null || true
+  )
+  rmdir "$GADGET_DIR"
 fi
 
 cd /sys/kernel/config/usb_gadget
@@ -151,5 +156,5 @@ if [ -z "$UDC" ]; then
 fi
 echo "$UDC" > UDC
 echo "briKVM gadget bound to $UDC as ${MANUFACTURER} ${PRODUCT} (${VENDOR_ID}:${PRODUCT_ID})"
-echo "Devices: /dev/hidg0 (kbd), /dev/hidg1 (mouse), /dev/video0 (UVC gadget),"
-echo "         /dev/video10 (v4l2loopback source), hw:UAC2Gadget (mic)"
+echo "Devices: /dev/hidg0 (kbd), /dev/hidg1 (mouse), uvc.usb0 (camera),"
+echo "         /dev/video50 (v4l2loopback source), hw:UAC2Gadget (mic)"
