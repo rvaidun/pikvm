@@ -57,8 +57,8 @@ cut_micro_hdmi = false; // the KVM doesn't use the Pi's own HDMI outputs
 cut_audio      = false;
 
 /* [Waveshare HDMI-to-CSI adapter] */
-ad_w        = 26.2;  // size across the case (x), measured ~25-26 mm
-ad_d        = 42.2;  // size front-to-back (y), HDMI on the back edge, measured ~41-42 mm
+ad_w        = 27;    // size across the case (x), measured ~25-26 mm, rounded up
+ad_d        = 43;    // size front-to-back (y), HDMI on the back edge, measured ~41-42 mm, rounded up
 ad_pcb      = 1.6;
 ad_gap      = 6;     // space between the Pi's GPIO edge and the adapter (ribbon bend)
 ad_center_x = 45;    // in Pi coordinates; 45 lines the ribbon up with the CAMERA connector
