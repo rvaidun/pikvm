@@ -51,7 +51,7 @@ sd_overhang = 2.5;      // microSD card sticks out past the left edge
 /* [Front wall openings (Pi USB-C edge)] */
 usbc_cut_w  = 13;    // generous so the USB-C splitter plug fits
 usbc_cut_h  = 8;
-cut_micro_hdmi = false; // the KVM doesn't use the Pi's own HDMI outputs
+cut_micro_hdmi = true;
 cut_audio      = true;
 
 /* [Waveshare HDMI-to-CSI adapter] */
@@ -178,7 +178,7 @@ module base() {
             // Front wall: USB-C (power/data splitter)
             port_cut_y(11.2, pcb_top + 1.6 - usbc_cut_h / 2, usbc_cut_w, usbc_cut_h);
             if (cut_micro_hdmi) for (x = [26, 39.5])
-                port_cut_y(x, pcb_top - 1, 10, 6);
+                port_cut_y(x, pcb_top + 1.75 - 3.5, 11, 7);
             if (cut_audio)
                 port_cut_y(53.5, pcb_top - 0.5, 8, 8);
 
