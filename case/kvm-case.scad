@@ -52,7 +52,7 @@ sd_overhang = 2.5;      // microSD card sticks out past the left edge
 usbc_cut_w  = 13;    // generous so the USB-C splitter plug fits
 usbc_cut_h  = 8;
 cut_micro_hdmi = false; // the KVM doesn't use the Pi's own HDMI outputs
-cut_audio      = false;
+cut_audio      = true;
 
 /* [Waveshare HDMI-to-CSI adapter] */
 ad_w        = 26.2;  // size across the case (x), measured ~25-26 mm
