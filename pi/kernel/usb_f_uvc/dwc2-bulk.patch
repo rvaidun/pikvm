@@ -1,0 +1,177 @@
+--- a/f_uvc.c
++++ b/f_uvc.c
+@@ -32,7 +32,22 @@
+ unsigned int uvc_gadget_trace_param;
+ module_param_named(trace, uvc_gadget_trace_param, uint, 0644);
+ MODULE_PARM_DESC(trace, "Trace level bitmask");
++
++/*
++ * Bulk streaming. Isochronous IN on dwc2 without descriptor DMA (e.g. the
++ * Raspberry Pi 4) has to re-arm the endpoint from the completion interrupt
++ * before every service interval and loses a large share of packets; bulk has
++ * no such deadline. Every request carries one payload of bulk_payload bytes,
++ * which userspace must report as dwMaxPayloadTransferSize.
++ */
++static bool uvc_bulk;
++module_param_named(bulk, uvc_bulk, bool, 0444);
++MODULE_PARM_DESC(bulk, "Stream over a bulk endpoint instead of isochronous");
+ 
++static unsigned int uvc_bulk_payload = 16384;
++module_param_named(bulk_payload, uvc_bulk_payload, uint, 0444);
++MODULE_PARM_DESC(bulk_payload, "Bulk payload (and request) size in bytes");
++
+ /* --------------------------------------------------------------------------
+  * Function descriptors
+  */
+@@ -266,6 +281,21 @@
+ void uvc_function_setup_continue(struct uvc_device *uvc, int disable_ep)
+ {
+ 	struct usb_composite_dev *cdev = uvc->func.config->cdev;
++
++	if (uvc_bulk) {
++		/*
++		 * No SET_INTERFACE is waiting on us: bulk streams start and stop
++		 * from userspace. On stop, cycle the endpoint so requests the
++		 * host never read are flushed; this also resets the data toggle.
++		 */
++		if (disable_ep && uvc->video.ep && uvc->video.ep->enabled) {
++			usb_ep_disable(uvc->video.ep);
++			if (!config_ep_by_speed(cdev->gadget, &uvc->func,
++						uvc->video.ep))
++				usb_ep_enable(uvc->video.ep);
++		}
++		return;
++	}
+ 
+ 	if (disable_ep && uvc->video.ep)
+ 		usb_ep_disable(uvc->video.ep);
+@@ -284,6 +314,8 @@
+ 		return 0;
+ 	else if (interface != uvc->streaming_intf)
+ 		return -EINVAL;
++	else if (uvc_bulk)
++		return 0;
+ 	else
+ 		return uvc->video.ep->enabled ? 1 : 0;
+ }
+@@ -330,11 +362,28 @@
+ 	if (interface != uvc->streaming_intf)
+ 		return -EINVAL;
+ 
+-	/* TODO
+-	if (usb_endpoint_xfer_bulk(&uvc->desc.vs_ep))
+-		return alt ? -EINVAL : 0;
+-	*/
++	if (uvc_bulk) {
++		/* The bulk endpoint lives in alt 0; there is no alt 1. */
++		if (alt)
++			return -EINVAL;
+ 
++		if (!uvc->video.ep->enabled) {
++			ret = config_ep_by_speed(cdev->gadget, f, uvc->video.ep);
++			if (ret)
++				return ret;
++			ret = usb_ep_enable(uvc->video.ep);
++			if (ret)
++				return ret;
++		} else {
++			/* SET_INTERFACE resets the data toggle. */
++			usb_ep_clear_halt(uvc->video.ep);
++		}
++
++		uvc->video.max_req_size = uvc_bulk_payload;
++		uvc->video.max_payload_size = uvc_bulk_payload;
++		return 0;
++	}
++
+ 	switch (alt) {
+ 	case 0:
+ 		if (uvc->state != UVC_STATE_STREAMING)
+@@ -558,6 +607,10 @@
+ 	if (!uvc_control_desc || !uvc_streaming_cls)
+ 		return ERR_PTR(-ENODEV);
+ 
++	/* Bulk: the endpoint follows alt 0 directly; skip the alt 1 interface. */
++	if (uvc_bulk)
++		uvc_streaming_std++;
++
+ 	/*
+ 	 * Descriptors layout
+ 	 *
+@@ -730,6 +783,24 @@
+ 		cpu_to_le16(max_packet_size * max_packet_mult *
+ 			    (opts->streaming_maxburst + 1));
+ 
++	if (uvc_bulk) {
++		uvc_bulk_payload = clamp(rounddown(uvc_bulk_payload, 1024),
++					 1024U, 65536U);
++
++		uvc_fs_streaming_ep.bmAttributes = USB_ENDPOINT_XFER_BULK;
++		uvc_fs_streaming_ep.wMaxPacketSize = cpu_to_le16(64);
++		uvc_fs_streaming_ep.bInterval = 0;
++		uvc_hs_streaming_ep.bmAttributes = USB_ENDPOINT_XFER_BULK;
++		uvc_hs_streaming_ep.wMaxPacketSize = cpu_to_le16(512);
++		uvc_hs_streaming_ep.bInterval = 0;
++		uvc_ss_streaming_ep.bmAttributes = USB_ENDPOINT_XFER_BULK;
++		uvc_ss_streaming_ep.wMaxPacketSize = cpu_to_le16(1024);
++		uvc_ss_streaming_ep.bInterval = 0;
++		uvc_ss_streaming_comp.bmAttributes = 0;
++		uvc_ss_streaming_comp.wBytesPerInterval = 0;
++		uvc_streaming_intf_alt0.bNumEndpoints = 1;
++	}
++
+ 	/* Allocate endpoints. */
+ 	if (opts->enable_interrupt_ep) {
+ 		ep = usb_ep_autoconfig(cdev->gadget, &uvc_interrupt_ep);
+--- a/uvc_video.c
++++ b/uvc_video.c
+@@ -112,7 +112,14 @@
+ 	len -= ret;
+ 
+ 	req->length = video->req_size - len;
+-	req->zero = video->payload_size == video->max_payload_size;
++	/*
++	 * The host ends a payload on a short packet or once it holds
++	 * max_payload_size bytes. A frame's last payload is usually short,
++	 * but if it happens to end on a packet boundary it needs a ZLP, or
++	 * the host would run it into the next frame's header.
++	 */
++	req->zero = buf->bytesused == video->queue.buf_used &&
++		    video->payload_size < video->max_payload_size;
+ 
+ 	if (buf->bytesused == video->queue.buf_used) {
+ 		video->queue.buf_used = 0;
+@@ -359,6 +366,7 @@
+ 		break;
+ 
+ 	case -EXDEV:
++	case -ENODATA:	/* dwc2 reports missed isoc slots as -ENODATA */
+ 		uvcg_dbg(&video->uvc->func, "VS request missed xfer.\n");
+ 		if (req->length != 0)
+ 			queue->flags |= UVC_QUEUE_DROP_INCOMPLETE;
+@@ -426,6 +434,14 @@
+ 	struct usb_request *req;
+ 	int ret = 0;
+ 
++	/*
++	 * Bulk requests are queued by the pump as they are filled. There is no
++	 * ready list to drain and no zero-length padding to send; looping here
++	 * would just cycle req_free forever.
++	 */
++	if (is_bulk)
++		return;
++
+ 	while (true) {
+ 		if (!video->ep->enabled)
+ 			return;
+@@ -507,8 +523,9 @@
+ 
+ 	if (!usb_endpoint_xfer_isoc(video->ep->desc)) {
+ 		video->req_size = max_req_size;
++		/* A worst-case frame's worth, but no more than 32 in flight. */
+ 		video->reqs_per_frame = video->uvc_num_requests =
+-			DIV_ROUND_UP(video->imagesize, max_req_size);
++			min(DIV_ROUND_UP(video->imagesize, max_req_size), 32U);
+ 
+ 		return;
+ 	}

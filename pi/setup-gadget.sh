@@ -2,8 +2,8 @@
 # Creates a composite USB gadget on the Pi 4 that presents to the target PC as:
 #   - HID keyboard (/dev/hidg0)
 #   - HID mouse    (/dev/hidg1)
-#   - UVC camera   (fed by uvc-gadget from v4l2loopback /dev/video50)
-#   - UAC2 mic     (ALSA hw:UAC2Gadget capture, fed by the receiver's ffmpeg)
+#   - UVC camera   (driven by receiver.py on the gadget's /dev/videoN)
+#   - UAC2 mic     (ALSA hw:UAC2Gadget playback, fed by the receiver's ffmpeg)
 #
 # Needs:
 #   /boot/firmware/config.txt   dtoverlay=dwc2,dr_mode=peripheral
@@ -37,12 +37,6 @@ SERIAL="${SERIAL:-$(awk -F: '/Serial/ {gsub(/ /,"",$2); print $2}' /proc/cpuinfo
 SERIAL="${SERIAL:-00000000DEADBEEF}"
 
 modprobe libcomposite
-# v4l2loopback is the staging buffer between the Mac-stream receiver (ffmpeg)
-# and the UVC gadget. exclusive_caps=1 makes it look like a plain capture
-# device to uvc-gadget once ffmpeg is writing. video_nr=50 because the Pi 4's
-# hardware codec/ISP already own /dev/video10-31. Options also live in
-# /etc/modprobe.d/kvm-v4l2loopback.conf so any loader gets the same node.
-modprobe v4l2loopback video_nr=50 card_label="briKVM-Loopback" exclusive_caps=1 || true
 
 # --- Teardown previous instance (idempotent) --------------------------------
 # ConfigFS only lets you remove things in reverse creation order: symlinks
@@ -119,6 +113,14 @@ echo -ne '\x05\x01\x09\x02\xA1\x01\x09\x01\xA1\x00\x05\x09\x19\x01\x29\x03\x15\x
 # --- UVC function (1280x720 MJPG @ 30fps) -----------------------------------
 mkdir -p functions/uvc.usb0/control/header/h
 echo "$CAMERA_NAME" > functions/uvc.usb0/function_name
+# The patched usb_f_uvc that install.sh builds streams over bulk
+# (/etc/modprobe.d/kvm-uvc.conf: bulk=1) and ignores these two. They only
+# apply with the stock module, i.e. isochronous: there the Pi 4's dwc2 misses
+# a good share of packets whatever the setting, and each miss corrupts a
+# frame. 2 KB every 500 us (bInterval 3, 4 MB/s) misses least; 2 KB is the
+# largest packet that fits the Pi 4's 2 KB periodic TX FIFOs.
+echo "${UVC_INTERVAL:-3}"     > functions/uvc.usb0/streaming_interval
+echo "${UVC_MAXPACKET:-2048}" > functions/uvc.usb0/streaming_maxpacket
 cd functions/uvc.usb0/control
 ln -s header/h class/fs
 ln -s header/h class/ss
@@ -145,19 +147,22 @@ for speed in fs hs ss; do
   cd -
 done
 
-# --- UAC2 function (mic to host = capture direction) ------------------------
+# --- UAC2 function (microphone) ---------------------------------------------
+# f_uac2 names directions from the gadget's side: p_* is the IN endpoint (we
+# play into ALSA, the host records it -> a microphone), c_* is the OUT
+# endpoint (the host plays to us -> a speaker). We only want the mic.
 mkdir -p functions/uac2.usb0
-echo 2     > functions/uac2.usb0/c_chmask    # stereo capture
-echo 48000 > functions/uac2.usb0/c_srate
-echo 2     > functions/uac2.usb0/c_ssize     # 16-bit
-echo 0     > functions/uac2.usb0/p_chmask    # no playback (host->Pi)
+echo 3     > functions/uac2.usb0/p_chmask    # stereo
+echo 48000 > functions/uac2.usb0/p_srate
+echo 2     > functions/uac2.usb0/p_ssize     # 16-bit
+echo 0     > functions/uac2.usb0/c_chmask    # no speaker
 echo "$MIC_NAME" > functions/uac2.usb0/function_name
 
 # --- Wire functions into the configuration ---------------------------------
-# Link order sets interface numbers. UVC must come first (interfaces 0/1):
-# the kernel renumbers UVC requests to 0/1 for userspace, and uvc-gadget
-# matches them against the real configfs numbers, so anywhere else it
-# ignores every probe request and the host can never start the camera.
+# Link order sets interface numbers. Keep UVC first (interfaces 0/1): the
+# kernel renumbers UVC requests to 0/1 for userspace, and UVC drivers that
+# compare those against the real interface numbers (uvc-gadget does) only
+# work when the two agree.
 ln -s functions/uvc.usb0  configs/c.1/
 ln -s functions/hid.usb0  configs/c.1/
 ln -s functions/hid.usb1  configs/c.1/
@@ -172,6 +177,14 @@ if [ -z "$UDC" ]; then
   exit 1
 fi
 echo "$UDC" > UDC
+# Give the USB controller's interrupt a core of its own (the kvm-* services
+# are confined to cores 0-2), so isochronous deadlines aren't missed while
+# ffmpeg/ustreamer are busy.
+IRQ=$(awk -F: -v udc="$UDC" '$0 ~ udc {gsub(/ /,"",$1); print $1; exit}' /proc/interrupts)
+if [ -n "$IRQ" ]; then
+  echo "${USB_IRQ_CPU:-3}" > "/proc/irq/$IRQ/smp_affinity_list" 2>/dev/null || true
+fi
+
 echo "briKVM gadget bound to $UDC as ${MANUFACTURER} ${PRODUCT} (${VENDOR_ID}:${PRODUCT_ID})"
 echo "Devices: /dev/hidg0 (kbd), /dev/hidg1 (mouse), uvc.usb0 (camera),"
-echo "         /dev/video50 (v4l2loopback source), hw:UAC2Gadget (mic)"
+echo "         hw:UAC2Gadget (mic)"

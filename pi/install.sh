@@ -8,13 +8,14 @@
 #     target PC and the splitter's barrel jack supplies power.
 #
 # What it does:
-#   1. Enables the dwc2 USB OTG controller in peripheral mode.
-#   2. Autoloads dwc2 + libcomposite at boot; pins v4l2loopback to /dev/video50.
-#   3. Installs ffmpeg + v4l2loopback (DKMS, needs kernel headers) + build deps.
-#   4. Builds and installs uvc-gadget (+ libuvcgadget) from freedesktop.org.
+#   1. Enables the dwc2 USB OTG controller in peripheral mode and the
+#      TC358743 HDMI-to-CSI overlay.
+#   2. Autoloads dwc2 + libcomposite at boot; loads usb_f_uvc in bulk mode.
+#   3. Installs ffmpeg, ustreamer, aiohttp, kernel headers + build tools.
+#   4. Builds the patched usb_f_uvc (kernel/usb_f_uvc/) for the running kernel.
 #   5. Copies bridge.py, receiver.py, the shell helpers and the EDID to /opt/kvm/.
-#   6. Installs udev rule and all five systemd units, enables them.
-#   7. Installs aiohttp (apt pkg) for the WebSocket bridge.
+#   6. Installs the udev rule and the four systemd units, enables them, and
+#      removes units from older versions (kvm-uvc).
 
 set -euo pipefail
 
@@ -58,14 +59,16 @@ dwc2
 libcomposite
 EOF
 
-# /dev/video10-31 belong to the Pi 4's hardware codec/ISP, so park the
-# loopback at /dev/video50 no matter who loads the module.
-cat > /etc/modprobe.d/kvm-v4l2loopback.conf <<'EOF'
-options v4l2loopback video_nr=50 card_label=briKVM-Loopback exclusive_caps=1
+# Stream the camera over bulk, not isochronous (see kernel/usb_f_uvc/build.sh).
+# The stock module ignores the unknown option, and receiver.py falls back to
+# isochronous when the patched module isn't loaded.
+cat > /etc/modprobe.d/kvm-uvc.conf <<'EOF'
+options usb_f_uvc bulk=1
 EOF
+rm -f /etc/modprobe.d/kvm-v4l2loopback.conf   # from versions that used v4l2loopback
 
-# --- 3. apt deps (ffmpeg, v4l2loopback, build tooling for uvc-gadget) -------
-# v4l2loopback is built by DKMS, so the running kernel's headers must exist.
+# --- 3. apt deps ---------------------------------------------------------------
+# The patched usb_f_uvc is built against the running kernel's headers.
 # Ubuntu raspi: linux-headers-$(uname -r). Raspberry Pi OS: linux-headers-rpi-v8.
 HEADERS_PKG="linux-headers-$(uname -r)"
 apt-cache show "$HEADERS_PKG" >/dev/null 2>&1 || HEADERS_PKG="linux-headers-rpi-v8"
@@ -75,25 +78,16 @@ apt-get install -y \
   python3-aiohttp \
   ustreamer edid-decode \
   ffmpeg \
-  v4l-utils v4l2loopback-dkms \
-  libasound2-dev \
-  build-essential git pkg-config meson ninja-build
+  v4l-utils \
+  build-essential curl patch
 
-# --- 4. Build uvc-gadget from source (not packaged in Debian/Ubuntu) -------
-# `meson install` puts the binary in /usr/local/bin and its shared
-# libuvcgadget in /usr/local/lib, hence the ldconfig.
-if [ ! -x /usr/local/bin/uvc-gadget ]; then
-  BUILD_DIR=$(mktemp -d)
-  trap "rm -rf $BUILD_DIR" EXIT
-  git clone --depth 1 https://gitlab.freedesktop.org/camera/uvc-gadget.git "$BUILD_DIR/uvc-gadget"
-  meson setup --prefix=/usr/local "$BUILD_DIR/uvc-gadget/build" "$BUILD_DIR/uvc-gadget"
-  meson install -C "$BUILD_DIR/uvc-gadget/build"
-  ldconfig
+# --- 4. Patched UVC gadget module ------------------------------------------
+# Without it the camera still works over isochronous, but on a Pi 4 the
+# picture is corrupted by dropped packets, so say so loudly.
+if ! bash "$SRC_DIR/kernel/usb_f_uvc/build.sh"; then
+  echo "WARNING: building the patched usb_f_uvc failed; the camera will use the" >&2
+  echo "         stock isochronous module and its frames will be corrupted." >&2
 fi
-echo "uvc-gadget installed at /usr/local/bin/uvc-gadget"
-
-# Fail loudly now rather than at first boot if the DKMS build didn't work.
-modprobe v4l2loopback || echo "WARNING: v4l2loopback failed to load; check 'dkms status'" >&2
 
 # --- 5. Deploy code ---------------------------------------------------------
 install -d -o root -g root -m 0755 /opt/kvm
@@ -104,7 +98,7 @@ install -o root -g root -m 0755 "$SRC_DIR/hdmi-capture.sh" /opt/kvm/hdmi-capture
 rm -f /opt/kvm/receiver.sh   # replaced by receiver.py
 install -d -o root -g root -m 0755 /opt/kvm/edid
 install -o root -g root -m 0644 "$SRC_DIR/edid/1080p50.hex" /opt/kvm/edid/1080p50.hex
-install -o root -g root -m 0755 "$SRC_DIR/uvc-handler.sh"  /opt/kvm/uvc-handler.sh
+rm -f /opt/kvm/uvc-handler.sh   # replaced by receiver.py's UVC driver
 install -d -o root -g root -m 0755 /opt/kvm/static
 install -o root -g root -m 0644 "$SRC_DIR/static/index.html" /opt/kvm/static/index.html
 
@@ -137,33 +131,39 @@ udevadm control --reload-rules
 
 install -o root -g root -m 0644 "$SRC_DIR/kvm-gadget.service"   /etc/systemd/system/kvm-gadget.service
 install -o root -g root -m 0644 "$SRC_DIR/kvm-bridge.service"   /etc/systemd/system/kvm-bridge.service
-install -o root -g root -m 0644 "$SRC_DIR/kvm-uvc.service"      /etc/systemd/system/kvm-uvc.service
 install -o root -g root -m 0644 "$SRC_DIR/kvm-receiver.service" /etc/systemd/system/kvm-receiver.service
 install -o root -g root -m 0644 "$SRC_DIR/kvm-ustreamer.service" /etc/systemd/system/kvm-ustreamer.service
 
 # Patch the bridge service to use whichever user is installing (default rahul).
 sed -i "s/^User=.*/User=${BRIDGE_USER}/" /etc/systemd/system/kvm-bridge.service
 
+# kvm-uvc ran the freedesktop uvc-gadget daemon; receiver.py is the UVC
+# driver now and the two would fight over the gadget's video node.
+if [ -f /etc/systemd/system/kvm-uvc.service ]; then
+  systemctl disable --now kvm-uvc.service || true
+  rm -f /etc/systemd/system/kvm-uvc.service
+fi
+
 systemctl daemon-reload
 systemctl enable \
   kvm-gadget.service \
   kvm-bridge.service \
-  kvm-uvc.service \
   kvm-receiver.service \
   kvm-ustreamer.service
 
 cat <<EOF
 
-Install complete. Reboot to pick up the dwc2 peripheral overlay:
+Install complete. Reboot to pick up the overlays and the patched module:
 
   sudo reboot
 
 After reboot, verify:
-  ls -l /dev/hidg0 /dev/hidg1 /dev/video50
-  cat /sys/class/udc/*/state     # "configured" once the target enumerates the Pi
-  aplay -L | grep UAC2Gadget
-  systemctl status kvm-gadget kvm-bridge kvm-uvc kvm-receiver kvm-ustreamer
-  journalctl -fu kvm-bridge
+  ls -l /dev/hidg0 /dev/hidg1
+  cat /sys/class/udc/*/state                 # "configured" once the target enumerates the Pi
+  cat /sys/module/usb_f_uvc/parameters/bulk  # Y = patched module, bulk camera
+  cat /proc/asound/cards | grep UAC2Gadget
+  systemctl status kvm-gadget kvm-bridge kvm-receiver kvm-ustreamer
+  journalctl -fu kvm-receiver
 
 Then:
   1. Open http://<pi-ip>:8082/ in a browser and click the video.

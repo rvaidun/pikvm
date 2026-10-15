@@ -28,7 +28,13 @@ if [ -z "$DEVICE" ]; then
   exit 1
 fi
 
-# Loading the EDID pulses hot-plug, so the source re-reads it and picks a mode.
+# Clearing the EDID drops hot-plug and loading it raises it again, so the
+# source sees a monitor unplug and replug, re-reads the EDID and picks a mode.
+# Reloading the same EDID alone is too brief a blip for Windows to notice
+# after it has given up on the output, so a restart of this service doubles
+# as "re-detect the display".
+v4l2-ctl -d "$DEVICE" --clear-edid=pad=0
+sleep 2
 v4l2-ctl -d "$DEVICE" --set-edid=pad=0,file="$EDID",format=hex
 echo "EDID loaded on $DEVICE; streaming on http://${LISTEN_HOST}:${LISTEN_PORT}/stream"
 

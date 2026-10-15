@@ -1,10 +1,8 @@
 [Unit]
-Description=briKVM receiver (Mac UDP -> v4l2loopback MJPEG + ALSA UAC2Gadget)
+Description=briKVM receiver + UVC camera driver (Mac UDP -> USB camera + UAC2 mic)
 After=kvm-gadget.service network-online.target
 Requires=kvm-gadget.service
 Wants=network-online.target
-Before=kvm-uvc.service
-ConditionPathExists=/dev/video50
 
 [Service]
 Type=simple
@@ -12,6 +10,9 @@ EnvironmentFile=-/etc/kvm-receiver.env
 ExecStart=/usr/bin/python3 /opt/kvm/receiver.py
 Restart=always
 RestartSec=2
+# Core 3 is reserved for the USB controller interrupt (see setup-gadget.sh).
+CPUAffinity=0-2
+Nice=5
 
 [Install]
 WantedBy=multi-user.target

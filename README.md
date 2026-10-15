@@ -12,7 +12,7 @@ them as a plug-and-play USB conferencing device.
                        │                                                 ▼               │
  Browser ◄───────────► │ bridge.py :8082 (web UI + WebSocket) ─► /dev/hidg0 (keyboard)   │
                        │                                      └► /dev/hidg1 (mouse)      │──► USB-C ──► Target PC
- Mac webcam + mic ───► │ receiver.py udp:1234 ─► /dev/video50 ─► uvc-gadget (camera)     │   (via PiKVM   sees "Logitech MeetUp":
+ Mac webcam + mic ───► │ receiver.py udp:1234 ─► UVC gadget (camera, USB bulk)           │   (via PiKVM   sees "Logitech MeetUp":
   (forward.sh)         │                      └► ALSA UAC2Gadget (microphone)            │    splitter)   kbd + mouse + cam + mic
                        └─────────────────────────────────────────────────────────────────┘
 ```
@@ -78,18 +78,20 @@ The installer is idempotent; re-run it any time. It:
 
 1. Sets `dtoverlay=dwc2,dr_mode=peripheral` in `/boot/firmware/config.txt`, replacing the bare `dtoverlay=dwc2` (OTG) that Ubuntu ships.
 2. Adds `dtoverlay=tc358743` for the HDMI-to-CSI bridge. It has no EEPROM, so camera auto-detect never finds it.
-3. Autoloads `dwc2` and `libcomposite`, and pins v4l2loopback to `/dev/video50`. `/dev/video10`–`31` belong to the Pi 4's hardware codec and ISP.
-4. Installs ffmpeg, ustreamer, v4l2loopback-dkms plus the matching kernel headers, and build tools.
-5. Builds [uvc-gadget](https://gitlab.freedesktop.org/camera/uvc-gadget) into `/usr/local`. It isn't packaged.
-6. Copies the code to `/opt/kvm/`, then installs the udev rule and the five systemd units and enables them.
+3. Autoloads `dwc2` and `libcomposite`, and sets `options usb_f_uvc bulk=1` in `/etc/modprobe.d/kvm-uvc.conf`.
+4. Installs ffmpeg, ustreamer, the matching kernel headers and build tools.
+5. Builds a patched `usb_f_uvc` kernel module for the running kernel (`pi/kernel/usb_f_uvc/build.sh`) and installs it to `/lib/modules/$(uname -r)/updates/`. See [Why a patched UVC module](#why-a-patched-uvc-module). **Re-run the installer after a kernel upgrade**, or the stock module comes back and the camera picture breaks up.
+6. Copies the code to `/opt/kvm/`, then installs the udev rule and the four systemd units and enables them. It also removes `kvm-uvc` and the v4l2loopback config left by older versions.
 
 ### 4. Verify after the reboot
 
 ```sh
-systemctl is-active kvm-gadget kvm-bridge kvm-receiver kvm-uvc kvm-ustreamer   # all "active"
+systemctl is-active kvm-gadget kvm-bridge kvm-receiver kvm-ustreamer   # all "active"
 cat /sys/class/udc/*/state            # "configured" = the target has enumerated the Pi
 cat /sys/class/udc/*/current_speed    # "high-speed"
-ls -l /dev/hidg0 /dev/hidg1 /dev/video50
+cat /sys/module/usb_f_uvc/parameters/bulk   # "Y" = patched module, camera on bulk
+cat /proc/asound/cards | grep UAC2Gadget    # the mic's ALSA side
+ls -l /dev/hidg0 /dev/hidg1
 curl -s localhost:8080/state          # ustreamer: "online": true and the HDMI resolution
 ```
 
@@ -144,8 +146,7 @@ on the Pi. Note that the gadget only advertises 1280×720.
 | `kvm-gadget` | `setup-gadget.sh`: builds the configfs composite gadget (HID kbd + mouse, UVC, UAC2) and binds it to the dwc2 UDC. | `/dev/hidg0`, `/dev/hidg1` |
 | `kvm-bridge` | `bridge.py`: serves the web UI and turns WebSocket messages into HID reports. | TCP 8082 |
 | `kvm-ustreamer` | `hdmi-capture.sh`: loads the EDID into the TC358743, then runs ustreamer with the Pi's hardware JPEG encoder. | TCP 8080 |
-| `kvm-receiver` | `receiver.py`: decodes the Mac's stream into MJPEG on `/dev/video50` (black frames when idle) and PCM to the UAC2 mic. | UDP 1234 |
-| `kvm-uvc` | `uvc-handler.sh`: runs `uvc-gadget` to move frames from `/dev/video50` to the USB camera. | — |
+| `kvm-receiver` | `receiver.py`: the UVC camera driver. It answers the host's camera control requests, decodes the Mac's stream into MJPEG frames for the USB camera (black frames when idle), and sends PCM to the UAC2 mic. | UDP 1234 |
 
 Logs: `journalctl -fu kvm-<name>`.
 
@@ -158,29 +159,34 @@ Logs: `journalctl -fu kvm-<name>`.
 | `/etc/kvm-ustreamer.env` | `EDID`, `LISTEN_HOST`, `LISTEN_PORT`, `QUALITY` |
 
 Restart the relevant unit after editing. Changing the USB identity needs
-`sudo systemctl restart kvm-gadget kvm-uvc`.
+`sudo systemctl restart kvm-gadget kvm-receiver`.
 
 ### Updating
 
 ```sh
 cd ~/pikvm && git pull
 sudo bash pi/install.sh
-sudo systemctl restart kvm-gadget kvm-receiver kvm-uvc kvm-bridge kvm-ustreamer
+sudo systemctl stop kvm-receiver kvm-bridge
+sudo systemctl restart kvm-gadget       # rebuilds the gadget; the target sees a replug
+sudo systemctl start kvm-bridge kvm-receiver
+sudo systemctl restart kvm-ustreamer
 ```
 
-A reboot is only needed if `config.txt` changed.
+A reboot is only needed if `config.txt` changed, or if a new `usb_f_uvc` was
+built while the old one was loaded (`modinfo -n usb_f_uvc` shows the file;
+`lsmod | grep usb_f_uvc` shows it's in use). Rebooting is the easy way to
+load the new module.
 
 ---
 
 ## Troubleshooting
 
 **Target never chimes / `/sys/class/udc/*/state` says `not attached`**
-1. `systemctl status kvm-uvc`: **uvc-gadget must be running.** The kernel's UVC
-   function keeps the *whole* gadget, keyboard and mouse included, disconnected
-   until uvc-gadget opens it. That in turn needs `kvm-receiver` to be feeding
-   `/dev/video50`.
-2. `grep fe980000 /proc/interrupts`: if the count stays at 0 while uvc-gadget is
-   running, the target isn't on the bus at all. Suspect the cable first
+1. `systemctl status kvm-receiver`: **receiver.py must be running.** The
+   kernel's UVC function keeps the *whole* gadget, keyboard and mouse included,
+   disconnected until a process subscribes to the camera's control events.
+2. `grep fe980000 /proc/interrupts`: if the count stays at 0 while kvm-receiver
+   is running, the target isn't on the bus at all. Suspect the cable first
    (charge-only cables are common), then the splitter port (it must be the
    data port, not PWR), then the target's USB port.
 3. `dmesg | grep dwc2`: if you see `DWC OTG Controller ... new USB bus registered`,
@@ -189,7 +195,12 @@ A reboot is only needed if `config.txt` changed.
 
 **Web UI shows no video / ustreamer reports `online: false`**
 - `journalctl -u kvm-ustreamer`. "No signal" usually means the target hasn't
-  re-read the EDID. Unplug and replug the HDMI cable, or `sudo systemctl restart kvm-ustreamer`.
+  re-read the EDID or has turned the output off. `sudo systemctl restart
+  kvm-ustreamer` clears and reloads the EDID, which looks like a monitor
+  unplug and replug to the target. If `v4l2-ctl -d /dev/v4l-subdev0 --log-status`
+  then shows `Cable detected (+5V power): yes` but `TMDS signal detected: no`,
+  the Pi is fine and the target is the one not sending. Wake it, press
+  **Win+P → Duplicate**, or use **Settings → Display → Detect**.
 - `v4l2-ctl -d /dev/video0 --query-dv-timings` shows what the target is sending.
 - The Pi 4's CSI port has 2 lanes, so the ceiling is **1080p50**. The shipped
   EDID (`pi/edid/1080p50.hex`) prefers 1920×1080@50 with 1280×720@60 as
@@ -200,6 +211,19 @@ A reboot is only needed if `config.txt` changed.
 - Black bars on the sides mean the target is mirroring a non-16:9 laptop panel.
   Switch Windows to "Show only on 2" or "Extend" to get the full frame.
 
+**Camera picture is corrupted (RGB blocks, the top of the frame then solid green)**
+- `cat /sys/module/usb_f_uvc/parameters/bulk` must say `Y`. If the file is
+  missing, the stock module is loaded, which streams isochronously and loses
+  packets on a Pi 4 (see the design notes). Re-run `sudo bash pi/install.sh`
+  (it rebuilds the module for the running kernel) and reboot.
+- `journalctl -u kvm-receiver | grep "UVC gadget"` shows which mode receiver.py
+  picked: `bulk, max payload 16384` is right.
+
+**Camera app says "Something went wrong" with 0x80070428**
+- That's Windows' Camera Frame Server service crashing, not the Pi. If the Pi
+  is still sending video, the error is on the Windows side. In an admin
+  PowerShell: `Restart-Service FrameServer -Force`, or reboot the target.
+
 **Target sees the camera but it's black**
 - That's the idle placeholder; the Mac isn't reaching the Pi. Check
   `journalctl -fu kvm-receiver` while `forward.sh` runs. "Mac stream live" means
@@ -209,7 +233,11 @@ A reboot is only needed if `config.txt` changed.
 
 **Mic is silent**
 - The target has to have the MeetUp mic open; the gadget only moves audio
-  while the host is recording. `aplay -l` on the Pi should list `UAC2Gadget`.
+  while the host is recording. Until then `journalctl -u kvm-receiver` repeats
+  `audio sink exited ... restarting`, which is harmless.
+- `cat /proc/asound/UAC2Gadget/pcm0p/info` must exist. The mic is the gadget's
+  *playback* side (`p_chmask` in `setup-gadget.sh`). f_uac2 names directions
+  from the gadget's point of view, so `c_chmask` would make a speaker instead.
 
 **Keyboard or mouse do nothing**
 - `journalctl -fu kvm-bridge` should show `WS client connected` and
@@ -221,17 +249,34 @@ A reboot is only needed if `config.txt` changed.
 
 ## Design notes
 
-- **Why `/dev/video50`.** On a Pi 4, `/dev/video10`–`31` are the bcm2835
-  codec and ISP. Asking v4l2loopback for `video_nr=10` silently lands
-  somewhere else, and every hard-coded path breaks.
-- **Why MJPEG into the loopback.** The UVC gadget only advertises MJPEG
-  1280×720 (uncompressed 720p30 won't fit in USB 2.0 isochronous bandwidth),
-  and uvc-gadget passes the host's requested format straight through to its
-  source.
-- **Why receiver.py never lets go of the loopback.** See the first
-  troubleshooting item. If the producer went away whenever the Mac stopped
-  streaming, uvc-gadget would stop, and the target would lose its keyboard and
-  mouse along with the camera.
+- **Why receiver.py is the UVC driver.** The freedesktop `uvc-gadget` daemon
+  reads its source with DMABUF export, which v4l2loopback doesn't implement, so
+  the host's camera start timed out (`0xA00F4292`). receiver.py talks to the
+  gadget's video node directly: it answers probe/commit, mmaps the gadget's
+  buffers and copies in each JPEG. It must never exit (see the first
+  troubleshooting item), so it sends black frames when the Mac is idle.
+- **Why MJPEG only.** The camera advertises one format, MJPEG 1280×720 at
+  30 fps. Uncompressed 720p30 needs ~55 MB/s, more than USB 2.0 carries.
+- <a id="why-a-patched-uvc-module"></a>**Why a patched UVC module.** Webcams
+  normally stream isochronously: a reserved slot every 125–500 µs. The Pi 4's
+  dwc2 controller has no descriptor DMA, so the driver has to re-arm the
+  endpoint from an interrupt before every slot, and its hardware only tracks
+  even/odd slots. In practice about 12% of packets missed their slot. dwc2
+  reports a miss as `-ENODATA`, which stock f_uvc treats as fatal: it dropped
+  the half-sent frame without telling the host, and Windows spliced it onto
+  the next frame (RGB garbage). `pi/kernel/usb_f_uvc/dwc2-bulk.patch`:
+  - treats `-ENODATA` like the `-EXDEV` other controllers use, so a miss drops
+    its frame cleanly;
+  - adds a `bulk=1` module option that streams over a bulk endpoint instead.
+    Bulk has no deadline: the host polls and the Pi answers when ready, so
+    nothing is lost. Windows' built-in UVC driver supports bulk cameras.
+    Upstream f_uvc already had a bulk data path but no way to switch it on, and
+    its submit thread would spin forever with a bulk endpoint; the patch adds
+    the descriptors, the module options, and those fixes.
+  With bulk there is no alternate setting for the host to select, so
+  receiver.py starts streaming when the host commits a format and restarts on
+  the next commit. Each 16 KB request carries exactly one payload, so
+  `dwMaxPayloadTransferSize` is the module's `bulk_payload`.
 - **Why audio runs in a separate ffmpeg.** The UAC2 gadget's ALSA device only
   drains while the host is recording. A blocked ALSA write in the same ffmpeg
   as the video would freeze the camera too, so PCM hops over localhost UDP,
@@ -250,9 +295,9 @@ pi/                    Raspberry Pi 4 KVM (this README)
   install.sh           one-shot installer
   setup-gadget.sh      configfs composite gadget
   bridge.py            web UI + WebSocket → HID
-  receiver.py          Mac stream → loopback camera + UAC2 mic
-  uvc-handler.sh       uvc-gadget launcher
+  receiver.py          Mac stream → UVC camera driver + UAC2 mic
   hdmi-capture.sh      EDID + ustreamer launcher
+  kernel/usb_f_uvc/    patch + build script for the bulk-capable UVC gadget module
   edid/1080p50.hex     EDID for the TC358743
   static/index.html    browser UI
   *.service, *.rules   systemd units, udev rule

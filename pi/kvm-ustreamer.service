@@ -9,6 +9,8 @@ EnvironmentFile=-/etc/kvm-ustreamer.env
 ExecStart=/opt/kvm/hdmi-capture.sh
 Restart=always
 RestartSec=2
+# Core 3 is reserved for the USB controller interrupt (see setup-gadget.sh).
+CPUAffinity=0-2
 DynamicUser=yes
 SupplementaryGroups=video
 

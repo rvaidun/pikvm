@@ -16,6 +16,8 @@ ExecStart=/usr/bin/python3 /opt/kvm/bridge.py
 WorkingDirectory=/opt/kvm
 Restart=on-failure
 RestartSec=2
+# Core 3 is reserved for the USB controller interrupt (see setup-gadget.sh).
+CPUAffinity=0-2
 User=rahul
 SupplementaryGroups=input
 

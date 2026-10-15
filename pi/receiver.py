@@ -1,40 +1,49 @@
 #!/usr/bin/env python3
-"""Mac stream receiver + always-on camera feeder.
+"""Mac stream receiver + USB camera (UVC) and mic (UAC2) driver.
 
-Owns the v4l2loopback device for the lifetime of the service and keeps it
-fed with MJPEG frames, so the UVC gadget always has a live source:
+  Mac UDP MPEG-TS --ffmpeg--> MJPEG frames --> this process --> UVC gadget --> host webcam
+                         +--> raw PCM (localhost UDP) --> ffmpeg --> ALSA UAC2Gadget --> host mic
 
-  Mac UDP MPEG-TS --ffmpeg--> MJPEG frames  --> /dev/video50 --> uvc-gadget
-                         +--> raw PCM (localhost UDP) --> ffmpeg --> ALSA UAC2Gadget
+This process *is* the UVC userspace daemon: it answers the host's UVC
+control requests (format probe/commit, the two image controls the gadget
+advertises), and while the host is streaming it copies the newest JPEG into
+the gadget's mmap'd buffers. When the Mac isn't streaming it sends a black
+placeholder, so the camera always works.
 
-When the Mac isn't streaming, a black placeholder frame is written instead.
-This matters because the kernel's UVC function holds the *whole* composite
-gadget (keyboard and mouse included) disconnected from the host until
-uvc-gadget is running, and uvc-gadget needs a capture-capable source to
-start. If the feeder came and went with the Mac stream, the target PC would
-lose its keyboard and mouse every time the stream stopped.
+With the patched usb_f_uvc loaded with bulk=1 (pi/kernel/usb_f_uvc), the
+camera streams over a bulk endpoint. Bulk has no alternate setting for the
+host to select, so streaming starts when the host commits a format rather
+than on UVC_EVENT_STREAMON, and dwMaxPayloadTransferSize is the module's
+bulk_payload instead of the isochronous packet size.
 
-Audio goes through a separate ffmpeg process because the UAC2 gadget's ALSA
-device only drains while the host has the mic open; a blocked ALSA write
-would otherwise stall video too. The localhost UDP hop never blocks.
+It has to run all the time: the kernel's UVC function keeps the *whole*
+composite gadget (keyboard and mouse included) disconnected from the host
+until a process subscribes to UVC events on the gadget's video node.
+
+Audio goes through a separate ffmpeg because the UAC2 gadget's ALSA device
+only drains while the host has the mic open; a blocked ALSA write would
+otherwise stall video. The localhost UDP hop never blocks.
 
 Env vars:
   PORT            UDP port the Mac streams to          (default 1234)
-  WIDTH/HEIGHT    Frame size advertised by the gadget  (default 1280x720)
-  FPS             Output frame rate                     (default 30)
-  MJPEG_QUALITY   ffmpeg -q:v, 2 (best) .. 31 (worst)   (default 5)
-  LOOPBACK        v4l2loopback device                   (default /dev/video50)
+  WIDTH/HEIGHT    Must match the gadget's UVC frame    (default 1280x720)
+  FPS             Re-encode frame rate                  (default 30)
+  MJPEG_QUALITY   ffmpeg -q:v, 2 (best) .. 31 (worst)   (default 7)
   AUDIO_PORT      localhost port for the PCM hop        (default 1236)
   UAC2_CARD       ALSA device for the gadget mic        (default hw:UAC2Gadget)
+  GADGET          configfs gadget name                  (default brikvm)
 """
+import errno
 import fcntl
 import logging
+import mmap
 import os
-import queue
+import select
 import struct
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("receiver")
@@ -43,10 +52,10 @@ PORT = int(os.environ.get("PORT", "1234"))
 WIDTH = int(os.environ.get("WIDTH", "1280"))
 HEIGHT = int(os.environ.get("HEIGHT", "720"))
 FPS = int(os.environ.get("FPS", "30"))
-MJPEG_QUALITY = os.environ.get("MJPEG_QUALITY", "5")
-LOOPBACK = os.environ.get("LOOPBACK", "/dev/video50")
+MJPEG_QUALITY = os.environ.get("MJPEG_QUALITY", "7")
 AUDIO_PORT = int(os.environ.get("AUDIO_PORT", "1236"))
 UAC2_CARD = os.environ.get("UAC2_CARD", "hw:UAC2Gadget")
+GADGET = os.environ.get("GADGET", "brikvm")
 
 # Mac stream silent for this long -> switch to the placeholder.
 STALE_AFTER = 1.0
@@ -55,34 +64,83 @@ PLACEHOLDER_FPS = 5
 # new Mac session starts with a fresh demuxer/decoder.
 UDP_TIMEOUT_US = 5_000_000
 
-# --- V4L2 output setup -------------------------------------------------------
-# struct v4l2_format on 64-bit: u32 type, 4 bytes pad, 200-byte union. We only
-# fill the v4l2_pix_format head (12 x u32).
-VIDIOC_S_FMT = 0xC0D05605
+# --- Kernel ABI (64-bit; verified against linux/videodev2.h + g_uvc.h) -------
+VIDIOC_S_FMT = 0xC0D05605           # struct v4l2_format, 208 bytes
+VIDIOC_REQBUFS = 0xC0145608         # struct v4l2_requestbuffers, 20 bytes
+VIDIOC_QUERYBUF = 0xC0585609        # struct v4l2_buffer, 88 bytes
+VIDIOC_QBUF = 0xC058560F
+VIDIOC_DQBUF = 0xC0585611
+VIDIOC_STREAMON = 0x40045612
+VIDIOC_STREAMOFF = 0x40045613
+VIDIOC_DQEVENT = 0x80885659         # struct v4l2_event, 136 bytes, union at +8
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A  # struct v4l2_event_subscription, 32 bytes
+UVCIOC_SEND_RESPONSE = 0x40405501   # struct uvc_request_data: s32 length + 60 bytes
+
 V4L2_BUF_TYPE_VIDEO_OUTPUT = 2
-V4L2_PIX_FMT_MJPEG = 0x47504A4D  # 'MJPG'
+V4L2_MEMORY_MMAP = 1
 V4L2_FIELD_NONE = 1
+V4L2_PIX_FMT_MJPEG = 0x47504A4D     # 'MJPG'
 V4L2_COLORSPACE_JPEG = 7
+BUF_SIZE = 88
+
+UVC_EVENT_CONNECT = 0x08000000
+UVC_EVENT_DISCONNECT = 0x08000001
+UVC_EVENT_STREAMON = 0x08000002
+UVC_EVENT_STREAMOFF = 0x08000003
+UVC_EVENT_SETUP = 0x08000004
+UVC_EVENT_DATA = 0x08000005
+
+UVC_SET_CUR, UVC_GET_CUR, UVC_GET_MIN, UVC_GET_MAX = 0x01, 0x81, 0x82, 0x83
+UVC_GET_RES, UVC_GET_LEN, UVC_GET_INFO, UVC_GET_DEF = 0x84, 0x85, 0x86, 0x87
+UVC_VS_PROBE_CONTROL, UVC_VS_COMMIT_CONTROL = 0x01, 0x02
+# f_uvc rewrites wIndex's interface byte for userspace: 0 = control, 1 = streaming.
+UVC_INTF_CONTROL, UVC_INTF_STREAMING = 0, 1
+
+# struct uvc_streaming_control (UVC 1.1, 34 bytes, packed little-endian)
+STREAMING_CTRL = struct.Struct("<HBBIHHHHHIIIBBBB")
+FRAME_INTERVAL = 10_000_000 // 30   # 100 ns units; the gadget advertises 30 fps only
 
 
-def open_loopback() -> int:
-    fd = os.open(LOOPBACK, os.O_WRONLY)
-    sizeimage = WIDTH * HEIGHT * 2  # worst case for MJPEG; matches the gadget's dwMaxVideoFrameBufferSize
-    pix = struct.pack("12I", WIDTH, HEIGHT, V4L2_PIX_FMT_MJPEG, V4L2_FIELD_NONE,
-                      0, sizeimage, V4L2_COLORSPACE_JPEG, 0, 0, 0, 0, 0)
-    fmt = struct.pack("I4x", V4L2_BUF_TYPE_VIDEO_OUTPUT) + pix
-    fmt += b"\0" * (208 - len(fmt))
-    fcntl.ioctl(fd, VIDIOC_S_FMT, bytearray(fmt))
-    log.info("Loopback %s configured: MJPEG %dx%d", LOOPBACK, WIDTH, HEIGHT)
-    return fd
+def streaming_ctrl(max_payload: int) -> bytes:
+    return STREAMING_CTRL.pack(
+        1,                      # bmHint: dwFrameInterval is fixed
+        1, 1,                   # bFormatIndex, bFrameIndex (MJPEG 1280x720, the only one)
+        FRAME_INTERVAL,
+        0, 0, 0, 0, 0,          # wKeyFrameRate .. wDelay
+        WIDTH * HEIGHT * 2,     # dwMaxVideoFrameSize, matches dwMaxVideoFrameBufferSize
+        max_payload,            # dwMaxPayloadTransferSize
+        0,                      # dwClockFrequency
+        3, 1, 1, 1)             # bmFramingInfo (FID+EOF), preferred/min/max payload version
+
+
+# Image controls the gadget's default descriptors advertise (read-only in
+# configfs, so we have to answer for them): camera terminal (entity 1)
+# auto-exposure mode, processing unit (entity 2) brightness, plus the
+# interface's request error code. (entity, selector) -> spec.
+CONTROLS = {
+    (0, 0x02): dict(fmt="<B", info=0x01, cur=0, mn=0, mx=0, res=0, df=0),        # VC_REQUEST_ERROR_CODE
+    (1, 0x02): dict(fmt="<B", info=0x03, cur=2, mn=2, mx=2, res=2, df=2),        # CT_AE_MODE: auto only
+    (2, 0x02): dict(fmt="<h", info=0x03, cur=128, mn=0, mx=255, res=1, df=128),  # PU_BRIGHTNESS
+}
 
 
 def make_placeholder() -> bytes:
     return subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
          "-f", "lavfi", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}",
-         "-frames:v", "1", "-pix_fmt", "yuvj422p", "-f", "mjpeg", "-"],
+         "-frames:v", "1", "-pix_fmt", "yuvj420p", "-f", "mjpeg", "-"],
         check=True, capture_output=True).stdout
+
+
+class FrameStore:
+    """Newest Mac frame, written by the receiver thread, read by the UVC loop."""
+
+    def __init__(self):
+        self.latest = (0, 0.0, b"")   # (seq, monotonic time, jpeg); swapped atomically
+
+    def push(self, jpeg: bytes):
+        seq = self.latest[0] + 1
+        self.latest = (seq, time.monotonic(), jpeg)
 
 
 # --- ffmpeg children ---------------------------------------------------------
@@ -98,7 +156,7 @@ def audio_sink_loop():
         time.sleep(2)
 
 
-def read_mpjpeg(stream, frames: "queue.Queue[bytes]"):
+def read_mpjpeg(stream, store: FrameStore):
     """Parse ffmpeg's multipart MJPEG (-f mpjpeg) output into JPEG frames."""
     while True:
         length = None
@@ -116,55 +174,267 @@ def read_mpjpeg(stream, frames: "queue.Queue[bytes]"):
         data = stream.read(length)
         if len(data) < length:
             return
-        try:
-            frames.put_nowait(data)
-        except queue.Full:
-            pass  # writer is behind; drop rather than add latency
+        store.push(data)
 
 
-def receiver_loop(frames: "queue.Queue[bytes]"):
+def receiver_loop(store: FrameStore):
     """Run the UDP -> MJPEG decoder, respawning it whenever it exits."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
            "-fflags", "+nobuffer+discardcorrupt", "-flags", "low_delay",
            "-i", f"udp://0.0.0.0:{PORT}?overrun_nonfatal=1&fifo_size=1000000&timeout={UDP_TIMEOUT_US}",
            "-map", "0:v",
-           "-vf", f"scale={WIDTH}:{HEIGHT},fps={FPS},format=yuvj422p",
+           "-vf", f"scale={WIDTH}:{HEIGHT},fps={FPS},format=yuvj420p",
            "-c:v", "mjpeg", "-q:v", MJPEG_QUALITY, "-f", "mpjpeg", "pipe:1",
            "-map", "0:a", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
            "-f", "s16le", f"udp://127.0.0.1:{AUDIO_PORT}?pkt_size=1024"]
     while True:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        read_mpjpeg(proc.stdout, frames)
+        read_mpjpeg(proc.stdout, store)
         proc.wait()
         time.sleep(0.5)
 
 
+# --- UVC gadget --------------------------------------------------------------
+def find_uvc_node() -> str:
+    """The gadget's video node is named after the UDC it's bound to."""
+    udc_file = Path(f"/sys/kernel/config/usb_gadget/{GADGET}/UDC")
+    for _ in range(60):
+        udc = udc_file.read_text().strip() if udc_file.exists() else ""
+        if udc:
+            for node in Path("/sys/class/video4linux").glob("video*"):
+                if (node / "name").read_text().strip() == udc:
+                    return f"/dev/{node.name}"
+        time.sleep(1)
+    raise SystemExit(f"no UVC gadget video node for {GADGET}; is kvm-gadget running?")
+
+
+class UvcCamera:
+    NBUFS = 4
+
+    def __init__(self, path: str, store: FrameStore, placeholder: bytes):
+        self.store = store
+        self.placeholder = placeholder
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        params = Path("/sys/module/usb_f_uvc/parameters")
+        self.bulk = (params / "bulk").exists() and (params / "bulk").read_text().strip() == "Y"
+        if self.bulk:
+            max_payload = int((params / "bulk_payload").read_text())
+        else:
+            max_payload = int(Path(f"/sys/kernel/config/usb_gadget/{GADGET}/functions/uvc.usb0/streaming_maxpacket").read_text())
+        self.ctrl = streaming_ctrl(max_payload)
+        self.values = {k: v["cur"] for k, v in CONTROLS.items()}
+        self.pending_set = None       # (interface, entity, selector) awaiting its DATA stage
+        self.maps: list[mmap.mmap] = []
+        self.free: list[int] = []
+        self.streaming = False
+        self.queue_on = False         # VIDIOC_STREAMON done; DQBUF is only valid after it
+        self.sent_seq = -1
+        self.sent_at = 0.0
+        self.live = False
+        # Subscribing to SETUP is what lets the gadget connect to the host.
+        for ev in (UVC_EVENT_CONNECT, UVC_EVENT_DISCONNECT, UVC_EVENT_STREAMON,
+                   UVC_EVENT_STREAMOFF, UVC_EVENT_SETUP, UVC_EVENT_DATA):
+            fcntl.ioctl(self.fd, VIDIOC_SUBSCRIBE_EVENT, struct.pack("<III20x", ev, 0, 0))
+        log.info("UVC gadget %s ready (%s, max payload %d)", path,
+                 "bulk" if self.bulk else "isochronous", max_payload)
+
+    # -- control requests --
+    def respond(self, data: bytes | None):
+        """data=None stalls the request."""
+        if data is None:
+            buf = struct.pack("<i60x", -errno.EL2HLT)
+        else:
+            buf = struct.pack("<i", len(data)) + data.ljust(60, b"\0")
+        fcntl.ioctl(self.fd, UVCIOC_SEND_RESPONSE, buf)
+
+    def on_setup(self, raw: bytes):
+        req_type, req, value, index, length = struct.unpack("<BBHHH", raw)
+        intf, entity, cs = index & 0xFF, index >> 8, value >> 8
+        if (req_type & 0x60) != 0x20 or (req_type & 0x1F) != 0x01:   # class, interface
+            return self.respond(None)
+
+        if intf == UVC_INTF_STREAMING:
+            if cs not in (UVC_VS_PROBE_CONTROL, UVC_VS_COMMIT_CONTROL):
+                return self.respond(None)
+            if req == UVC_SET_CUR:
+                self.pending_set = (intf, entity, cs)
+                return self.respond(bytes(min(length, STREAMING_CTRL.size)))
+            if req in (UVC_GET_CUR, UVC_GET_MIN, UVC_GET_MAX, UVC_GET_DEF):
+                return self.respond(self.ctrl[:length])   # one format/frame/interval: all the same
+            if req == UVC_GET_RES:
+                return self.respond(bytes(min(length, STREAMING_CTRL.size)))
+            if req == UVC_GET_LEN:
+                return self.respond(struct.pack("<H", STREAMING_CTRL.size))
+            if req == UVC_GET_INFO:
+                return self.respond(b"\x03")
+            return self.respond(None)
+
+        spec = CONTROLS.get((entity, cs))
+        if intf != UVC_INTF_CONTROL or spec is None:
+            return self.respond(None)
+        pack = lambda v: struct.pack(spec["fmt"], v)
+        if req == UVC_SET_CUR:
+            self.pending_set = (intf, entity, cs)
+            return self.respond(bytes(struct.calcsize(spec["fmt"])))
+        answer = {
+            UVC_GET_CUR: lambda: pack(self.values[(entity, cs)]),
+            UVC_GET_MIN: lambda: pack(spec["mn"]),
+            UVC_GET_MAX: lambda: pack(spec["mx"]),
+            UVC_GET_RES: lambda: pack(spec["res"]),
+            UVC_GET_DEF: lambda: pack(spec["df"]),
+            UVC_GET_INFO: lambda: bytes([spec["info"]]),
+            UVC_GET_LEN: lambda: struct.pack("<H", struct.calcsize(spec["fmt"])),
+        }.get(req)
+        self.respond(answer() if answer else None)
+
+    def on_data(self, payload: bytes):
+        target, self.pending_set = self.pending_set, None
+        if target is None:
+            return
+        intf, entity, cs = target
+        if intf == UVC_INTF_STREAMING:
+            if cs == UVC_VS_COMMIT_CONTROL:
+                log.info("Host committed MJPEG %dx%d @ %d fps", WIDTH, HEIGHT, 10_000_000 // FRAME_INTERVAL)
+                if self.bulk:
+                    # No alt setting to select with bulk: a commit is the start
+                    # signal. The host never says when it stops, so a new
+                    # commit restarts the stream (flushing what it never read).
+                    self.stream_on()
+            return    # only one format exists, so probe/commit always resolve to self.ctrl
+        spec = CONTROLS[(entity, cs)]
+        self.values[(entity, cs)] = struct.unpack_from(spec["fmt"], payload.ljust(4, b"\0"))[0]
+
+    # -- streaming --
+    def stream_on(self):
+        if self.streaming:
+            self.stream_off()
+        fmt = bytearray(208)
+        struct.pack_into("<I", fmt, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT)
+        struct.pack_into("<12I", fmt, 8, WIDTH, HEIGHT, V4L2_PIX_FMT_MJPEG, V4L2_FIELD_NONE,
+                         0, WIDTH * HEIGHT * 2, V4L2_COLORSPACE_JPEG, 0, 0, 0, 0, 0)
+        fcntl.ioctl(self.fd, VIDIOC_S_FMT, fmt)
+        rb = bytearray(struct.pack("<IIII4x", self.NBUFS, V4L2_BUF_TYPE_VIDEO_OUTPUT, V4L2_MEMORY_MMAP, 0))
+        fcntl.ioctl(self.fd, VIDIOC_REQBUFS, rb)
+        count = struct.unpack_from("<I", rb, 0)[0]
+        for i in range(count):
+            b = self._buf(i)
+            fcntl.ioctl(self.fd, VIDIOC_QUERYBUF, b)
+            offset, length = struct.unpack_from("<I", b, 64)[0], struct.unpack_from("<I", b, 72)[0]
+            self.maps.append(mmap.mmap(self.fd, length, mmap.MAP_SHARED,
+                                       mmap.PROT_READ | mmap.PROT_WRITE, offset=offset))
+        self.free = list(range(count))
+        self.sent_seq, self.sent_at = -1, 0.0
+        self.streaming = True
+        self.pump(reclaim=False)          # have a frame queued before the host's first poll
+        fcntl.ioctl(self.fd, VIDIOC_STREAMON, struct.pack("<i", V4L2_BUF_TYPE_VIDEO_OUTPUT))
+        self.queue_on = True
+        log.info("Host started streaming (%d buffers)", count)
+
+    def stream_off(self):
+        if not self.streaming:
+            return
+        self.streaming = self.queue_on = False
+        try:
+            fcntl.ioctl(self.fd, VIDIOC_STREAMOFF, struct.pack("<i", V4L2_BUF_TYPE_VIDEO_OUTPUT))
+        except OSError as e:
+            log.warning("STREAMOFF: %s", e)
+        for m in self.maps:
+            m.close()
+        self.maps, self.free = [], []
+        fcntl.ioctl(self.fd, VIDIOC_REQBUFS,
+                    bytearray(struct.pack("<IIII4x", 0, V4L2_BUF_TYPE_VIDEO_OUTPUT, V4L2_MEMORY_MMAP, 0)))
+        log.info("Host stopped streaming")
+
+    @staticmethod
+    def _buf(index: int, bytesused: int = 0) -> bytearray:
+        b = bytearray(BUF_SIZE)
+        struct.pack_into("<IIIII", b, 0, index, V4L2_BUF_TYPE_VIDEO_OUTPUT, bytesused, 0, V4L2_FIELD_NONE)
+        struct.pack_into("<I", b, 60, V4L2_MEMORY_MMAP)
+        return b
+
+    def pump(self, reclaim: bool = True):
+        """Reclaim sent buffers and queue the next frame if one is due."""
+        if not self.streaming:
+            return
+        while reclaim and self.queue_on:
+            b = self._buf(0)
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_DQBUF, b)
+            except BlockingIOError:
+                break
+            self.free.append(struct.unpack_from("<I", b, 0)[0])
+        if not self.free:
+            return
+
+        now = time.monotonic()
+        seq, when, frame = self.store.latest
+        live = bool(frame) and now - when < STALE_AFTER
+        if live != self.live:
+            log.info("Mac stream %s", "live" if live else "idle; sending placeholder")
+            self.live = live
+        if live:
+            if seq == self.sent_seq:
+                return
+            self.sent_seq = seq
+        else:
+            if now - self.sent_at < 1 / PLACEHOLDER_FPS:
+                return
+            frame = self.placeholder
+
+        idx = self.free.pop()
+        m = self.maps[idx]
+        if len(frame) > len(m):
+            log.warning("frame of %d bytes exceeds buffer (%d); dropped", len(frame), len(m))
+            self.free.append(idx)
+            return
+        m[:len(frame)] = frame
+        fcntl.ioctl(self.fd, VIDIOC_QBUF, self._buf(idx, len(frame)))
+        self.sent_at = now
+
+    def handle_events(self):
+        ev = bytearray(136)
+        while True:
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_DQEVENT, ev)
+            except OSError as e:
+                if e.errno == errno.ENOENT:
+                    return
+                raise
+            etype = struct.unpack_from("<I", ev, 0)[0]
+            u = bytes(ev[8:72])
+            if etype == UVC_EVENT_SETUP:
+                self.on_setup(u[:8])
+            elif etype == UVC_EVENT_DATA:
+                n = struct.unpack_from("<i", u, 0)[0]
+                self.on_data(u[4:4 + max(0, n)])
+            elif etype == UVC_EVENT_STREAMON:
+                self.stream_on()
+            elif etype == UVC_EVENT_STREAMOFF:
+                self.stream_off()
+            elif etype == UVC_EVENT_CONNECT:
+                log.info("Host connected")
+            elif etype == UVC_EVENT_DISCONNECT:
+                log.info("Host disconnected")
+                self.stream_off()
+
+    def run(self):
+        # select(), not poll(): the gadget reports POLLERR whenever it isn't
+        # streaming, which poll() always returns but select()'s except-set
+        # (POLLPRI only) ignores.
+        while True:
+            writers = [self.fd] if self.streaming else []
+            select.select([], writers, [self.fd], 1 / (FPS * 2))
+            self.handle_events()
+            self.pump()
+
+
 def main():
     placeholder = make_placeholder()
-    fd = open_loopback()
-    frames: "queue.Queue[bytes]" = queue.Queue(maxsize=4)
-
+    store = FrameStore()
     threading.Thread(target=audio_sink_loop, daemon=True).start()
-    threading.Thread(target=receiver_loop, args=(frames,), daemon=True).start()
+    threading.Thread(target=receiver_loop, args=(store,), daemon=True).start()
     log.info("Listening for the Mac stream on udp://0.0.0.0:%d", PORT)
-
-    last_live = 0.0
-    live = False
-    while True:
-        try:
-            frame = frames.get(timeout=1 / PLACEHOLDER_FPS)
-            if not live:
-                log.info("Mac stream live")
-                live = True
-            last_live = time.monotonic()
-        except queue.Empty:
-            if time.monotonic() - last_live < STALE_AFTER:
-                continue
-            if live:
-                log.info("Mac stream idle; sending placeholder")
-                live = False
-            frame = placeholder
-        os.write(fd, frame)
+    UvcCamera(find_uvc_node(), store, placeholder).run()
 
 
 if __name__ == "__main__":
