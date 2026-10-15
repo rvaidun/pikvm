@@ -1,14 +1,15 @@
 [Unit]
 Description=briKVM receiver (Mac UDP -> v4l2loopback MJPEG + ALSA UAC2Gadget)
-After=kvm-gadget.service kvm-uvc.service network-online.target
+After=kvm-gadget.service network-online.target
 Requires=kvm-gadget.service
 Wants=network-online.target
+Before=kvm-uvc.service
 ConditionPathExists=/dev/video50
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/kvm-receiver.env
-ExecStart=/opt/kvm/receiver.sh
+ExecStart=/usr/bin/python3 /opt/kvm/receiver.py
 Restart=always
 RestartSec=2
 

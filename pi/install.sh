@@ -12,8 +12,8 @@
 #   2. Autoloads dwc2 + libcomposite at boot; pins v4l2loopback to /dev/video50.
 #   3. Installs ffmpeg + v4l2loopback (DKMS, needs kernel headers) + build deps.
 #   4. Builds and installs uvc-gadget (+ libuvcgadget) from freedesktop.org.
-#   5. Copies bridge.py, setup-gadget.sh, receiver.sh, uvc-handler.sh to /opt/kvm/.
-#   6. Installs udev rule and all four systemd units, enables them.
+#   5. Copies bridge.py, receiver.py, the shell helpers and the EDID to /opt/kvm/.
+#   6. Installs udev rule and all five systemd units, enables them.
 #   7. Installs aiohttp (apt pkg) for the WebSocket bridge.
 
 set -euo pipefail
@@ -99,7 +99,11 @@ modprobe v4l2loopback || echo "WARNING: v4l2loopback failed to load; check 'dkms
 install -d -o root -g root -m 0755 /opt/kvm
 install -o root -g root -m 0755 "$SRC_DIR/setup-gadget.sh" /opt/kvm/setup-gadget.sh
 install -o root -g root -m 0755 "$SRC_DIR/bridge.py"       /opt/kvm/bridge.py
-install -o root -g root -m 0755 "$SRC_DIR/receiver.sh"     /opt/kvm/receiver.sh
+install -o root -g root -m 0755 "$SRC_DIR/receiver.py"     /opt/kvm/receiver.py
+install -o root -g root -m 0755 "$SRC_DIR/hdmi-capture.sh" /opt/kvm/hdmi-capture.sh
+rm -f /opt/kvm/receiver.sh   # replaced by receiver.py
+install -d -o root -g root -m 0755 /opt/kvm/edid
+install -o root -g root -m 0644 "$SRC_DIR/edid/1080p50.hex" /opt/kvm/edid/1080p50.hex
 install -o root -g root -m 0755 "$SRC_DIR/uvc-handler.sh"  /opt/kvm/uvc-handler.sh
 install -d -o root -g root -m 0755 /opt/kvm/static
 install -o root -g root -m 0644 "$SRC_DIR/static/index.html" /opt/kvm/static/index.html
@@ -135,6 +139,7 @@ install -o root -g root -m 0644 "$SRC_DIR/kvm-gadget.service"   /etc/systemd/sys
 install -o root -g root -m 0644 "$SRC_DIR/kvm-bridge.service"   /etc/systemd/system/kvm-bridge.service
 install -o root -g root -m 0644 "$SRC_DIR/kvm-uvc.service"      /etc/systemd/system/kvm-uvc.service
 install -o root -g root -m 0644 "$SRC_DIR/kvm-receiver.service" /etc/systemd/system/kvm-receiver.service
+install -o root -g root -m 0644 "$SRC_DIR/kvm-ustreamer.service" /etc/systemd/system/kvm-ustreamer.service
 
 # Patch the bridge service to use whichever user is installing (default rahul).
 sed -i "s/^User=.*/User=${BRIDGE_USER}/" /etc/systemd/system/kvm-bridge.service
@@ -144,7 +149,8 @@ systemctl enable \
   kvm-gadget.service \
   kvm-bridge.service \
   kvm-uvc.service \
-  kvm-receiver.service
+  kvm-receiver.service \
+  kvm-ustreamer.service
 
 cat <<EOF
 
@@ -156,7 +162,7 @@ After reboot, verify:
   ls -l /dev/hidg0 /dev/hidg1 /dev/video50
   cat /sys/class/udc/*/state     # "configured" once the target enumerates the Pi
   aplay -L | grep UAC2Gadget
-  systemctl status kvm-gadget kvm-bridge kvm-uvc kvm-receiver
+  systemctl status kvm-gadget kvm-bridge kvm-uvc kvm-receiver kvm-ustreamer
   journalctl -fu kvm-bridge
 
 Then:

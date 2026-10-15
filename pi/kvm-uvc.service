@@ -1,6 +1,6 @@
 [Unit]
 Description=briKVM UVC gadget daemon (/dev/video50 -> USB UVC)
-After=kvm-gadget.service
+After=kvm-gadget.service kvm-receiver.service
 Requires=kvm-gadget.service
 
 [Service]
