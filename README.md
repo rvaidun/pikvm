@@ -105,6 +105,29 @@ size, default 640×360), `FPS`, `VBITRATE`, `ABITRATE`, `PORT`. If you change th
 port, set the same `PORT` in `/etc/kvm-receiver.env` on the Pi. The Pi pads or
 scales whatever size arrives to the camera's 640×480 and 1280×720 frames.
 
+#### Fallback video
+
+`forward.sh` can switch the camera picture to a pre-recorded clip and back
+while it runs. Record yourself with QuickTime (File → New Movie Recording,
+using the same camera), then turn the recording into a clip once:
+
+```sh
+./make-fallback.sh ~/Downloads/sample.mov    # writes macforward/mac/fallback.mp4
+./forward.sh 192.168.1.8
+```
+
+With `fallback.mp4` present, press **f** for the clip, **l** for the live
+camera, **space** to toggle, and **q** to quit. `START=fallback` starts on the clip,
+and `FALLBACK=<file>` uses a different one. The mic stays live the whole time.
+Both sources go through the same ffmpeg and the same stream, so the switch
+is instant and the Pi needs no changes: the target just sees one camera.
+
+`make-fallback.sh` matches the clip to the live stream (640×360, 30 fps, no
+audio, metadata stripped) and hides the loop seam. `LOOP=pingpong` (the
+default) plays forward then backward, so there's no jump. That suits sitting
+and listening; for talking or gestures, use `LOOP=crossfade`, which dissolves
+the last second into the first. `START`/`DURATION` trim the recording.
+
 ---
 
 ## Services
