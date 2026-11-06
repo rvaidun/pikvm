@@ -21,6 +21,7 @@ Wire protocol (unchanged from the Pico era, newline-terminated ASCII):
   ping           no-op (kept for parity)
 """
 import asyncio
+import errno
 import logging
 import os
 import time
@@ -39,6 +40,48 @@ STATIC_DIR = Path(__file__).parent / "static"
 # HID usage IDs 0xE0..0xE7 are modifier keys. Their position in that range
 # is also their bit position in the keyboard report's modifier byte.
 MOD_FIRST, MOD_LAST = 0xE0, 0xE7
+
+
+class Waker:
+    """Wakes a sleeping target the way a real keyboard does: USB remote wakeup,
+    sent by the dwc2_wakeup module (pi/kernel/dwc2_wakeup). Called when the host
+    stops polling, i.e. it has suspended the bus. The write blocks for up to
+    ~0.5 s in the kernel, so it runs in a thread and at most every RETRY_S."""
+
+    PATH = os.environ.get("WAKE_PATH", "/sys/module/dwc2_wakeup/parameters/wake")
+    RETRY_S = 3.0
+
+    def __init__(self):
+        self.last = 0.0
+        self.task: asyncio.Task | None = None
+        self.warned = False
+
+    def kick(self):
+        now = time.monotonic()
+        if (self.task and not self.task.done()) or now - self.last < self.RETRY_S:
+            return
+        self.last = now
+        self.task = asyncio.get_running_loop().create_task(asyncio.to_thread(self._wake))
+
+    def _wake(self):
+        try:
+            fd = os.open(self.PATH, os.O_WRONLY)
+            try:
+                os.write(fd, b"1")
+            finally:
+                os.close(fd)
+            log.info("target was asleep; sent USB remote wakeup")
+        except OSError as e:
+            if e.errno == errno.EALREADY:
+                pass  # bus is awake; the host is just slow to poll
+            elif e.errno == errno.ETIMEDOUT:
+                log.warning("sent USB remote wakeup, but the target didn't resume (off or hibernating?)")
+            elif not self.warned:
+                self.warned = True
+                log.warning("can't wake the target via %s: %s", self.PATH, e)
+
+
+waker = Waker()
 
 
 class HidWriter:
@@ -87,6 +130,7 @@ class HidWriter:
                         except BlockingIOError:
                             if time.monotonic() > deadline:
                                 log.warning("%s: host isn't polling; dropped report", self.path)
+                                waker.kick()
                                 return
                             await asyncio.sleep(self.BUSY_RETRY_S)
                 except OSError as e:

@@ -81,9 +81,10 @@ Open **`http://<pi-ip>:8082/`**.
 
 ### Wake a sleeping target
 
-When the target sleeps, the screen shows no signal and keystrokes from the
-page are dropped (`journalctl -u kvm-bridge`: "host isn't polling"). To wake it
-the way a real keyboard would, run on the Pi:
+When the target sleeps, the screen shows no signal. Move the mouse or press a
+key on the page: the bridge notices the target has stopped polling and sends a
+USB remote wakeup, as a real keyboard would. The first moves are dropped, and
+the screen comes back a few seconds later. To do it by hand on the Pi:
 
 ```sh
 echo 1 | sudo tee /sys/module/dwc2_wakeup/parameters/wake
