@@ -33,6 +33,9 @@
   #more kbd { font: 12px ui-monospace, Menlo, monospace; color: #999; }
   #more .grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; padding: 0 2px; }
   #more .grid button { padding: 4px 0; }
+  #more .slider { display: flex; align-items: center; gap: 10px; padding: 4px 6px; }
+  #more .slider input { flex: 1; min-width: 0; accent-color: #6fe09a; }
+  #more .slider output { width: 3.2em; text-align: right; font: 12px ui-monospace, Menlo, monospace; color: #999; }
   #paste { width: 380px; }
   #paste textarea { box-sizing: border-box; width: 100%; height: 130px; resize: vertical;
     background: #0d0d0d; color: #ddd; border: 1px solid #333; border-radius: 4px; padding: 6px;
@@ -65,7 +68,7 @@
       <button data-keys="Escape" title="Esc (the browser keeps it to release capture)">Esc</button>
       <button data-keys="MetaLeft" title="Windows key on its own: Start menu">Win</button>
       <button data-keys="ControlLeft AltLeft Delete">Ctrl+Alt+Del</button>
-      <button popovertarget="more">Keys ▾</button>
+      <button popovertarget="more">More ▾</button>
       <button popovertarget="paste" title="Type text on the target as keystrokes">Paste text</button>
       <button id="typeStop" class="stop" hidden>Stop typing</button>
     </span>
@@ -106,6 +109,12 @@
       <button data-keys="NumLock" title="Num Lock">NumLk</button>
       <button data-keys="ScrollLock" title="Scroll Lock">ScrLk</button>
     </div>
+    <h4>Mouse</h4>
+    <label class="slider">
+      <span>Scroll speed</span>
+      <input id="scrollSpeed" type="range" min="0" max="9" step="1" value="5">
+      <output id="scrollSpeedOut">1×</output>
+    </label>
     <h4>Stuck keys</h4>
     <button class="item" id="releaseAll"><span>Release all keys and buttons</span><kbd></kbd></button>
   </div>
@@ -276,11 +285,50 @@ capture.addEventListener('mouseup', e => {
   const b = BTN[e.button]; if (b) send(`mu ${b}`);
 });
 capture.addEventListener('contextmenu', e => e.preventDefault());
+// A Mac trackpad or Magic Mouse sends a stream of small pixel deltas (~60 a
+// second, plus momentum after the fingers lift), but each HID wheel step is a
+// whole notch, which Windows scrolls 3 lines (~100 px). So add the deltas up
+// and send a notch per WHEEL_PX_PER_NOTCH, scaled by the scroll speed setting.
+// A new gesture, or a change of direction, scrolls one notch right away, so a
+// single click of a real wheel still does something.
+const WHEEL_PX_PER_NOTCH = 100;
+const WHEEL_GAP_MS = 250;   // a pause this long starts a new gesture
+const SCROLL_SPEEDS = [0.2, 0.3, 0.4, 0.5, 0.7, 1, 1.5, 2, 3, 4];
+const scrollInput = document.getElementById('scrollSpeed');
+const scrollOut = document.getElementById('scrollSpeedOut');
+let scrollSpeed = 1;
+function applyScrollSpeed() {
+  scrollSpeed = SCROLL_SPEEDS[scrollInput.value] ?? 1;
+  scrollOut.textContent = `${scrollSpeed}×`;
+}
+try {
+  const saved = localStorage.getItem('scrollSpeed');
+  if (saved != null && SCROLL_SPEEDS[saved] != null) scrollInput.value = saved;
+} catch {}
+applyScrollSpeed();
+scrollInput.addEventListener('input', () => {
+  applyScrollSpeed();
+  try { localStorage.setItem('scrollSpeed', scrollInput.value); } catch {}
+});
+
+let wheelAcc = 0, wheelLast = 0;
 capture.addEventListener('wheel', e => {
   if (!locked) return;
   e.preventDefault();
-  const d = Math.max(-127, Math.min(127, -Math.sign(e.deltaY) * Math.max(1, Math.abs(e.deltaY / 100 | 0))));
-  if (d) send(`mw ${d}`);
+  const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1;   // lines / pages -> px
+  const px = e.deltaY * unit * scrollSpeed;
+  if (!px) return;
+  const now = performance.now();
+  if (now - wheelLast > WHEEL_GAP_MS || px * wheelAcc < 0) {
+    wheelAcc = Math.sign(px) * Math.max(Math.abs(px), WHEEL_PX_PER_NOTCH);
+  } else {
+    wheelAcc += px;
+  }
+  wheelLast = now;
+  const notches = Math.trunc(wheelAcc / WHEEL_PX_PER_NOTCH);
+  if (!notches) return;
+  wheelAcc -= notches * WHEEL_PX_PER_NOTCH;
+  send(`mw ${Math.max(-127, Math.min(127, -notches))}`);
 }, { passive: false });
 
 // --- Toast ---
