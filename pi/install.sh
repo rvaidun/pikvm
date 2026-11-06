@@ -12,7 +12,8 @@
 #      TC358743 HDMI-to-CSI overlay.
 #   2. Autoloads dwc2 + libcomposite at boot; loads usb_f_uvc in bulk mode.
 #   3. Installs ffmpeg, ustreamer, aiohttp, kernel headers + build tools.
-#   4. Builds the patched usb_f_uvc (kernel/usb_f_uvc/) for the running kernel.
+#   4. Builds the patched usb_f_uvc (kernel/usb_f_uvc/) and dwc2_wakeup
+#      (kernel/dwc2_wakeup/, USB remote wakeup) for the running kernel.
 #   5. Copies bridge.py, receiver.py, the shell helpers and the EDID to /opt/kvm/.
 #   6. Installs the udev rule and the four systemd units, enables them, and
 #      removes units from older versions (kvm-uvc).
@@ -87,6 +88,12 @@ apt-get install -y \
 if ! bash "$SRC_DIR/kernel/usb_f_uvc/build.sh"; then
   echo "WARNING: building the patched usb_f_uvc failed; the camera will use the" >&2
   echo "         stock isochronous module and its frames will be corrupted." >&2
+fi
+# Lets the Pi wake a sleeping target, like pressing a key on a real keyboard
+# (dwc2 can't on its own). setup-gadget.sh loads it once the UDC is bound.
+if ! bash "$SRC_DIR/kernel/dwc2_wakeup/build.sh"; then
+  echo "WARNING: building dwc2_wakeup failed; the Pi won't be able to wake a" >&2
+  echo "         sleeping target." >&2
 fi
 
 # --- 5. Deploy code ---------------------------------------------------------

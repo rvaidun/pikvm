@@ -79,6 +79,23 @@ Open **`http://<pi-ip>:8082/`**.
 - The **Ctrl+Alt+Del** button sends the combo, since your own OS would intercept it otherwise.
 - Closing the tab also releases all keys and buttons, so nothing sticks down.
 
+### Wake a sleeping target
+
+When the target sleeps, the screen shows no signal and keystrokes from the
+page are dropped (`journalctl -u kvm-bridge`: "host isn't polling"). To wake it
+the way a real keyboard would, run on the Pi:
+
+```sh
+echo 1 | sudo tee /sys/module/dwc2_wakeup/parameters/wake
+cat /sys/module/dwc2_wakeup/parameters/state   # suspended=0 lx_state=L0 once it's awake
+```
+
+The write fails with "Operation already in progress" if the target is already
+awake, and with "Connection timed out" if it didn't respond. That happens when
+it's shut down or hibernating rather than asleep. The Pi 4's dwc2 driver can't
+send a remote wakeup by itself, so `kernel/dwc2_wakeup/` adds one; see the
+comment at the top of `dwc2_wakeup.c`.
+
 ### Forward the Mac's webcam and mic to the target
 
 On the Mac (needs `brew install ffmpeg`):
@@ -311,6 +328,7 @@ pi/                    Raspberry Pi 4 KVM (this README)
   hdmi-capture.sh      EDID + ustreamer launcher
   uvc-mode.sh          switch between the stock and patched camera drivers
   kernel/usb_f_uvc/    patch + build script for the bulk-capable UVC gadget module
+  kernel/dwc2_wakeup/  module that lets the Pi wake a sleeping target over USB
   edid/1080p50.hex     EDID for the TC358743
   static/index.html    browser UI
   *.service, *.rules   systemd units, udev rule

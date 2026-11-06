@@ -199,6 +199,10 @@ if [ -z "$UDC" ]; then
   exit 1
 fi
 echo "$UDC" > UDC
+# USB remote wakeup (kernel/dwc2_wakeup): echo 1 > /sys/module/dwc2_wakeup/parameters/wake
+# wakes a sleeping target. Loaded here, not from modules-load.d, because it
+# needs the dwc2 controller probed.
+modprobe dwc2_wakeup 2>/dev/null || echo "dwc2_wakeup not available; the Pi can't wake a sleeping target" >&2
 # Give the USB controller's interrupt a core of its own (the kvm-* services
 # are confined to cores 0-2), so isochronous deadlines aren't missed while
 # ffmpeg/ustreamer are busy.
