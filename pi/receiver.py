@@ -6,9 +6,17 @@
 
 This process *is* the UVC userspace daemon: it answers the host's UVC
 control requests (format probe/commit, the two image controls the gadget
-advertises), and while the host is streaming it copies the newest frame of
-the committed format into the gadget's mmap'd buffers. When the Mac isn't
+advertises), and while the host is streaming it copies frames of the
+committed format into the gadget's mmap'd buffers. When the Mac isn't
 streaming it sends a black placeholder, so the camera always works.
+
+Frames reach this process in clumps: Wi-Fi delivers a few late frames at
+once, and the Pi's hardware H.264 decoder released 7-9 at a time around each
+keyframe. Sending only the newest frame threw away all but the last of each
+clump, so the camera stuttered although no frame was lost. Instead each
+mode's frames queue up (FrameStore) and each goes out at its own time slot,
+JITTER_MS after an on-time frame would have arrived, so they leave evenly
+spaced; the mic is delayed by the same amount to stay in sync.
 
 The camera offers uncompressed YUY2 640x480@30 and 1280x720@10, plus MJPEG
 1280x720@30 with UVC_MJPEG=1 (MODES; setup-gadget.sh must declare the same
@@ -36,7 +44,8 @@ Env vars:
   PORT            UDP port the Mac streams to          (default 1234)
   UVC_MJPEG       1 = also offer MJPEG 1280x720@30      (default 0; must match setup-gadget.sh)
   MJPEG_QUALITY   ffmpeg -q:v, 2 (best) .. 31 (worst)   (default 7)
-  H264_DECODER    ffmpeg decoder for the Mac stream     (default h264_v4l2m2m; h264 = software)
+  H264_DECODER    ffmpeg decoder for the Mac stream     (default h264 = software; h264_v4l2m2m = hardware)
+  JITTER_MS       how far behind the Mac video plays, to smooth out late frames (default 500)
   AUDIO_PORT      localhost port for the PCM hop        (default 1236)
   UAC2_CARD       ALSA device for the gadget mic        (default hw:UAC2Gadget)
   GADGET          configfs gadget name                  (default g1)
@@ -44,6 +53,7 @@ Env vars:
 import errno
 import fcntl
 import logging
+import math
 import mmap
 import os
 import select
@@ -51,6 +61,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -58,9 +69,17 @@ log = logging.getLogger("receiver")
 
 PORT = int(os.environ.get("PORT", "1234"))
 MJPEG_QUALITY = os.environ.get("MJPEG_QUALITY", "7")
-# The Pi 4's hardware decoder takes ~1/5 of the CPU software h264 needs for
-# the Mac's 720p30 stream.
-H264_DECODER = os.environ.get("H264_DECODER", "h264_v4l2m2m")
+# Software, not the Pi 4's h264_v4l2m2m: for the Mac's 640x360 stream the
+# whole ffmpeg took 34% of a core with it vs 25% with the hardware decoder,
+# but the hardware decoder handed frames over 7-9 at a time around every
+# keyframe, which took a ~300 ms jitter buffer to hide. (It only paid off
+# when the Mac sent 720p, at ~1/5 the CPU.)
+H264_DECODER = os.environ.get("H264_DECODER", "h264")
+# Video plays this far behind an on-time frame's arrival, so frames delivered
+# late and in clumps still go out evenly. Wi-Fi alone spread frames over
+# ~80 ms, with the odd stall of 0.6 s.
+JITTER_MS = int(os.environ.get("JITTER_MS", "500"))
+DELAY = JITTER_MS / 1000
 AUDIO_PORT = int(os.environ.get("AUDIO_PORT", "1236"))
 UAC2_CARD = os.environ.get("UAC2_CARD", "hw:UAC2Gadget")
 GADGET = os.environ.get("GADGET", "g1")
@@ -175,14 +194,80 @@ def make_placeholder(mode: Mode) -> bytes:
 
 
 class FrameStore:
-    """Newest Mac frame, written by the receiver thread, read by the UVC loop."""
+    """One mode's decoded Mac frames, oldest first, each sent at its slot.
 
-    def __init__(self):
-        self.latest = (0, 0.0, b"")   # (seq, monotonic time, jpeg); swapped atomically
+    ffmpeg's fps filter makes the stream exactly 1/fps per frame, so frame n
+    of a session "should" arrive n periods after frame 0. How late it really
+    is (arrival - n * period) varies with Wi-Fi and the decoder; the least
+    lateness seen lately is what an on-time frame looks like, and every frame
+    is due DELAY after that. Frames then leave evenly spaced however they
+    arrived, and at a fixed delay the mic can match.
 
-    def push(self, jpeg: bytes):
-        seq = self.latest[0] + 1
-        self.latest = (seq, time.monotonic(), jpeg)
+    The receiver thread pushes; the UVC loop takes. Both run under a lock.
+    """
+
+    WINDOW = 5.0   # s; "lately" means the last 5-10 s, so clock drift and
+                   # changes in network delay are followed
+
+    def __init__(self, mode: Mode):
+        self.period = 1 / mode.fps
+        # The mode the host isn't streaming keeps filling too: keep at most
+        # one second more than the delay (~28 MB for 480p, the same for 720p).
+        self.cap = round((DELAY + 1) * mode.fps)
+        self.lock = threading.Lock()
+        self.frames: deque[tuple[int, bytes]] = deque()   # (n, frame)
+        self.last_push = 0.0
+        self.n = 0
+        self.mins = [math.inf, math.inf]   # least lateness, previous and current window
+        self.window_at = 0.0
+        self.late = 0                      # frames sent over a period after their slot, or dropped
+        self.count_from = 0.0              # ...except ffmpeg's startup backlog
+
+    def push(self, frame: bytes):
+        now = time.monotonic()
+        with self.lock:
+            if now - self.last_push > STALE_AFTER:
+                # A new Mac session (ffmpeg was respawned): numbering and
+                # lateness start over, and leftovers would never come due.
+                self.frames.clear()
+                self.n, self.mins, self.window_at = 0, [math.inf, math.inf], now
+                # A new ffmpeg first decodes the ~5 s it buffered while
+                # probing the stream, all at once; dropping that isn't news.
+                self.count_from = now + 2.0
+            self.last_push = now
+            if now - self.window_at > self.WINDOW:
+                self.mins, self.window_at = [self.mins[1], math.inf], now
+            self.mins[1] = min(self.mins[1], now - self.n * self.period)
+            self.frames.append((self.n, frame))
+            self.n += 1
+            while len(self.frames) > self.cap:
+                self.frames.popleft()
+
+    def _due(self, n: int) -> float:
+        return min(self.mins) + n * self.period + DELAY
+
+    def next_due(self) -> float | None:
+        with self.lock:
+            return self._due(self.frames[0][0]) if self.frames else None
+
+    def take(self, now: float) -> bytes | None:
+        """The newest frame whose slot has come, or None if none has. Older
+        due frames are dropped: they arrived too late (or the host wasn't
+        reading), and sending them now would bunch them up again."""
+        frame = due = None
+        dropped = 0
+        with self.lock:
+            while self.frames and (d := self._due(self.frames[0][0])) <= now:
+                if frame is not None:
+                    dropped += 1
+                frame, due = self.frames.popleft()[1], d
+            if now >= self.count_from:
+                self.late += dropped + (due is not None and now - due > self.period)
+        return frame
+
+    def clear(self):
+        with self.lock:
+            self.frames.clear()
 
 
 # --- ffmpeg children ---------------------------------------------------------
@@ -248,7 +333,7 @@ class Decoder:
     """Runs one UDP -> frames ffmpeg that feeds every mode at once.
 
     Each mode gets its own pipe and reader thread, and its FrameStore always
-    holds a current frame, so when the host switches modes (Chrome opens
+    holds recent frames, so when the host switches modes (Chrome opens
     480p, then moves to 720p) the next frame is already there. Restarting
     ffmpeg per mode instead left a second of black frames on every switch.
     With the Mac sending 640x360 this is cheap: 480p only pads, and 720p
@@ -280,7 +365,9 @@ class Decoder:
                 "-c:v", H264_DECODER,
                 "-i", f"udp://0.0.0.0:{PORT}?overrun_nonfatal=1&fifo_size=1000000&timeout={UDP_TIMEOUT_US}",
                 "-filter_complex", ";".join(graph), *args,
-                "-map", "0:a", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+                # Hold the mic back as long as the video's jitter buffer.
+                "-map", "0:a", "-af", f"adelay={JITTER_MS}:all=1",
+                "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
                 "-f", "s16le", f"udp://127.0.0.1:{AUDIO_PORT}?pkt_size=1024"]
 
     def run(self):
@@ -348,9 +435,9 @@ class UvcCamera:
         self.free: list[int] = []
         self.streaming = False
         self.queue_on = False         # VIDIOC_STREAMON done; DQBUF is only valid after it
-        self.sent_seq = -1
         self.sent_at = 0.0
         self.live = False
+        self.stats_at = time.monotonic()
         # Subscribing to SETUP is what lets the gadget connect to the host.
         for ev in (UVC_EVENT_CONNECT, UVC_EVENT_DISCONNECT, UVC_EVENT_STREAMON,
                    UVC_EVENT_STREAMOFF, UVC_EVENT_SETUP, UVC_EVENT_DATA):
@@ -461,9 +548,11 @@ class UvcCamera:
             self.maps.append(mmap.mmap(self.fd, length, mmap.MAP_SHARED,
                                        mmap.PROT_READ | mmap.PROT_WRITE, offset=offset))
         self.free = list(range(count))
-        self.sent_seq, self.sent_at = -1, 0.0
+        self.sent_at = 0.0
         self.streaming = True
         self.pump(reclaim=False)          # have a frame queued before the host's first poll
+        for store in self.stores.values():
+            store.late = 0                # catching up on a mode not streamed until now
         fcntl.ioctl(self.fd, VIDIOC_STREAMON, struct.pack("<i", V4L2_BUF_TYPE_VIDEO_OUTPUT))
         self.queue_on = True
         log.info("Host started streaming (%d buffers)", count)
@@ -510,20 +599,22 @@ class UvcCamera:
             return
 
         now = time.monotonic()
-        source = MODES[self.mode].source
-        seq, when, frame = self.stores[source].latest
-        live = bool(frame) and now - when < STALE_AFTER
+        mode = MODES[self.mode]
+        store = self.stores[mode.source]
+        # When the Mac stops, play out what's buffered before going black.
+        live = now - store.last_push < STALE_AFTER + DELAY
         if live != self.live:
             log.info("Mac stream %s", "live" if live else "idle; sending placeholder")
             self.live = live
         if live:
-            if seq == self.sent_seq:
+            frame = store.take(now)
+            if frame is None:
                 return
-            self.sent_seq = seq
         else:
+            store.clear()
             if now - self.sent_at < 1 / PLACEHOLDER_FPS:
                 return
-            frame = self.placeholders[source]
+            frame = self.placeholders[mode.source]
 
         idx = self.free.pop()
         m = self.maps[idx]
@@ -534,6 +625,19 @@ class UvcCamera:
         m[:len(frame)] = frame
         fcntl.ioctl(self.fd, VIDIOC_QBUF, self._buf(idx, len(frame), time.monotonic()))
         self.sent_at = now
+
+    def log_stats(self):
+        """Once a minute, say if frames arrived too late for JITTER_MS."""
+        now = time.monotonic()
+        if now - self.stats_at < 60:
+            return
+        late = sum(s.late for s in self.stores.values())
+        if late:
+            log.info("Camera: %d frames missed their slot in the last %d s; raise JITTER_MS"
+                     " (now %d) if this keeps happening", late, now - self.stats_at, JITTER_MS)
+        for s in self.stores.values():
+            s.late = 0
+        self.stats_at = now
 
     def handle_events(self):
         ev = bytearray(136)
@@ -567,15 +671,22 @@ class UvcCamera:
         # (POLLPRI only) ignores.
         while True:
             writers = [self.fd] if self.streaming else []
-            select.select([], writers, [self.fd], 1 / (MODES[self.mode].fps * 2))
+            timeout = 1 / (MODES[self.mode].fps * 2)
+            due = self.stores[MODES[self.mode].source].next_due()
+            if self.streaming and self.live and self.free and due is not None:
+                # Wake when the next frame is due. With no free buffer, the
+                # gadget handing one back wakes us instead.
+                timeout = min(timeout, max(0.0, due - time.monotonic()))
+            select.select([], writers, [self.fd], timeout)
             self.handle_events()
             self.pump()
+            self.log_stats()
 
 
 def main():
     sources = {m.source: m for m in MODES.values()}
     placeholders = {name: make_placeholder(m) for name, m in sources.items()}
-    decoder = Decoder({name: FrameStore() for name in sources})
+    decoder = Decoder({name: FrameStore(m) for name, m in sources.items()})
     threading.Thread(target=audio_sink_loop, daemon=True).start()
     threading.Thread(target=decoder.run, daemon=True).start()
     log.info("Listening for the Mac stream on udp://0.0.0.0:%d", PORT)

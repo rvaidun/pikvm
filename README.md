@@ -176,7 +176,7 @@ sudo /opt/kvm/uvc-mode.sh bulk     # patched, bulk: clean (the default)
 | File | Overrides |
 |---|---|
 | `/etc/kvm-gadget.env` | `VENDOR_ID`, `PRODUCT_ID`, `MANUFACTURER`, `PRODUCT`, `SERIAL` (USB identity); `CAMERA_NAME`, `MIC_NAME` (what Windows calls the camera and mic, default "Logitech MeetUp"); `UVC_MJPEG` (also offer MJPEG 720p30; set it in `kvm-receiver.env` too) |
-| `/etc/kvm-receiver.env` | `PORT`, `UVC_MJPEG`, `MJPEG_QUALITY`, `H264_DECODER`, `UAC2_CARD` |
+| `/etc/kvm-receiver.env` | `PORT`, `UVC_MJPEG`, `MJPEG_QUALITY`, `H264_DECODER`, `UAC2_CARD`; `JITTER_MS` (how far the camera and mic run behind the Mac to keep the video smooth, default 500) |
 | `/etc/kvm-ustreamer.env` | `EDID`, `LISTEN_HOST`, `LISTEN_PORT`, `QUALITY` |
 
 Restart the relevant unit after editing. Changing the USB identity needs
@@ -307,6 +307,17 @@ load the new module.
   receiver.py starts streaming when the host commits a format and restarts on
   the next commit. Each 16 KB request carries exactly one payload, so
   `dwMaxPayloadTransferSize` is the module's `bulk_payload`.
+- **Why the camera runs half a second behind.** No frames were lost between
+  the Mac and the Pi, but they arrived in clumps: Wi-Fi delivers a few late
+  frames at once (~80 ms of spread, the odd 0.6 s stall), and the Pi's hardware
+  H.264 decoder released 7-9 frames together around every keyframe. Sending
+  only the newest frame threw away all but the last of each clump, so the
+  camera stuttered. Now each frame has a time slot, `JITTER_MS` after an
+  on-time frame would have arrived, and goes out then; the mic is delayed by
+  the same amount. Decoding is in software (`H264_DECODER=h264`), which costs
+  ~10% of a core more for the Mac's 640x360 and removes the clumps.
+  `journalctl -u kvm-receiver` says once a minute if frames missed their
+  slot; raise `JITTER_MS` if that keeps happening.
 - **Why audio runs in a separate ffmpeg.** The UAC2 gadget's ALSA device only
   drains while the host is recording. A blocked ALSA write in the same ffmpeg
   as the video would freeze the camera too, so PCM hops over localhost UDP,

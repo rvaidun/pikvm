@@ -129,7 +129,8 @@ if [ ! -f /etc/kvm-receiver.env ]; then
 # UVC_MJPEG must match /etc/kvm-gadget.env.
 # PORT=1234
 # UVC_MJPEG=0
-# H264_DECODER=h264_v4l2m2m
+# H264_DECODER=h264
+# JITTER_MS=500
 EOF
 fi
 
