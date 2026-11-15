@@ -141,10 +141,13 @@ Both sources go through the same ffmpeg and the same stream, so the switch
 is instant and the Pi needs no changes: the target just sees one camera.
 
 `make-fallback.sh` matches the clip to the live stream (640×360, 30 fps, no
-audio, metadata stripped) and hides the loop seam. `LOOP=pingpong` (the
-default) plays forward then backward, so there's no jump. That suits sitting
-and listening; for talking or gestures, use `LOOP=crossfade`, which dissolves
-the last second into the first. `START`/`DURATION` trim the recording.
+audio, metadata stripped) and hides the loop seam. `LOOP=auto` (the default)
+searches the start and end of the recording for the two moments where you're
+in the same pose and moving the same way, cuts the loop there and dissolves
+over half a second, so your head ends where it started. `LOOP=pingpong` plays
+forward then backward (no jump at all, but odd if you talk or gesture);
+`LOOP=crossfade` dissolves the last second into the first wherever they are.
+`START`/`DURATION` trim the recording.
 
 ---
 

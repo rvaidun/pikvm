@@ -141,7 +141,15 @@ if [ "${#clips[@]}" -gt 0 ]; then
   clip_in=(-f rawvideo -pix_fmt yuv420p -video_size "${OUT_WIDTH}x${OUT_HEIGHT}"
            -framerate "$FPS" -i "$TMP/clip.yuv")
 else
-  clip_in=(-re -stream_loop -1 -i "$FALLBACK")
+  # Loop through the concat demuxer, the clip listed 1000 times, rather than
+  # -stream_loop alone: with -re, each -stream_loop wrap stalled the stream
+  # ~0.5 s and then burst, longer than the Pi's jitter buffer, so the loop
+  # point froze and skipped. Concat goes on to the next copy without the
+  # stall; -stream_loop only has to cover the (hours-long) list.
+  esc="$(printf '%s' "$FALLBACK" | sed "s/'/'\\\\''/g")"
+  { echo "ffconcat version 1.0"
+    for _ in $(seq 1000); do echo "file '$esc'"; done; } >"$TMP/loop.ffconcat"
+  clip_in=(-re -f concat -safe 0 -stream_loop -1 -i "$TMP/loop.ffconcat")
 fi
 
 if [ "$CLIPS_ONLY" = 1 ]; then   # input 0 is the mic alone: no camera to select
