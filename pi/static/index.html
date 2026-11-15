@@ -55,6 +55,13 @@
     background: rgba(20,20,20,0.9); border: 1px solid #333; padding: 5px 12px; border-radius: 4px;
     pointer-events: none; opacity: 0; transition: opacity 0.2s; font-size: 12px; }
   #toast.show { opacity: 1; }
+  /* Full screen: the bar is hidden and slides back in over the video when the
+     mouse touches the top edge (only while input isn't captured). */
+  body.fs #bar { position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+    transform: translateY(-100%); transition: transform 0.15s; box-shadow: 0 4px 16px rgba(0,0,0,0.6); }
+  body.fs.peek #bar { transform: none; }
+  #peekZone { display: none; position: fixed; top: 0; left: 0; right: 0; height: 4px; z-index: 9; }
+  body.fs #peekZone { display: block; }
 </style>
 </head>
 <body>
@@ -71,8 +78,10 @@
       <button popovertarget="more">More ▾</button>
       <button popovertarget="paste" title="Type text on the target as keystrokes">Paste text</button>
       <button id="typeStop" class="stop" hidden>Stop typing</button>
+      <button id="fullscreen" title="Full screen: hides this bar; move the mouse to the top edge to bring it back">Full screen</button>
     </span>
   </div>
+  <div id="peekZone"></div>
 
   <div id="more" popover>
     <h4>Windows</h4>
@@ -454,6 +463,34 @@ pasteText.addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendPaste(); }
 });
 typeStop.addEventListener('click', stopTyping);
+
+// --- Full screen ---
+// Esc releases capture first; a second Esc (or the button) leaves full screen.
+const fsBtn = document.getElementById('fullscreen');
+const peekZone = document.getElementById('peekZone');
+fsBtn.addEventListener('click', () => {
+  fsBtn.blur();
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(err => toast(`full screen failed: ${err.message}`));
+});
+function setPeek(on) { document.body.classList.toggle('peek', on && !locked); }
+document.addEventListener('fullscreenchange', () => {
+  const fs = !!document.fullscreenElement;
+  document.body.classList.toggle('fs', fs);
+  fsBtn.textContent = fs ? 'Exit full screen' : 'Full screen';
+  setPeek(false);
+});
+peekZone.addEventListener('mouseenter', () => setPeek(true));
+bar.addEventListener('mouseleave', () => {
+  // Keep the bar up while one of its menus is open.
+  if (!document.querySelector('[popover]:popover-open')) setPeek(false);
+});
+for (const pop of document.querySelectorAll('[popover]')) {
+  pop.addEventListener('toggle', e => {
+    if (e.newState === 'closed' && !bar.matches(':hover')) setPeek(false);
+  });
+}
+document.addEventListener('pointerlockchange', () => { if (locked) setPeek(false); });
 </script>
 </body>
 </html>
