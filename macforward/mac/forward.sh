@@ -2,7 +2,7 @@
 # Mac webcam + mic -> H.264/AAC MPEG-TS over UDP -> Pi
 #
 # Usage:
-#   ./forward.sh [pi-host]
+#   ./forward.sh [--clips-only] [pi-host]
 #   PORT=1234 OUT_WIDTH=640 OUT_HEIGHT=360 FPS=30 ./forward.sh 192.168.1.8
 #
 # The camera is captured at WIDTH x HEIGHT (a mode it supports) and scaled
@@ -27,6 +27,11 @@
 # one-shot clips to ffmpeg as one stream. Make a clip with mkdir clips and
 # LOOP=none ./make-fallback.sh <recording> clips/1-wave.mp4
 #
+# --clips-only (or --no-live): never send the camera. The camera isn't even
+# opened; the picture is the fallback clip and the one-shot clips, and only
+# the mic is live. It exits at once if the fallback clip or a one-shot clip
+# is missing or unreadable.
+#
 # Devices (from `ffmpeg -f avfoundation -list_devices true -i ""`):
 #   video 0 = MacBook Pro Camera
 #   audio 1 = MacBook Pro Microphone
@@ -36,7 +41,17 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PI_HOST="${1:-pizero.local}"
+CLIPS_ONLY=0
+PI_HOST=""
+for arg in "$@"; do
+  case "$arg" in
+    --clips-only|--no-live) CLIPS_ONLY=1 ;;
+    -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "Unknown option: $arg (see --help)" >&2; exit 2 ;;
+    *)  PI_HOST="$arg" ;;
+  esac
+done
+PI_HOST="${PI_HOST:-pizero.local}"
 PORT="${PORT:-1234}"
 WIDTH="${WIDTH:-1280}"
 HEIGHT="${HEIGHT:-720}"
@@ -54,12 +69,38 @@ START="${START:-live}"
 PREROLL_FRAMES="${PREROLL_FRAMES:-$((FPS / 5 + 1))}"
 CLIPS_DIR="${CLIPS_DIR:-$HERE/clips}"
 
-echo "Capturing ${WIDTH}x${HEIGHT}, streaming ${OUT_WIDTH}x${OUT_HEIGHT}@${FPS} to ${PI_HOST}:${PORT}"
-echo "Video device index: $VIDEO_IDX   Audio device index: $AUDIO_IDX"
+clips=()
+for f in "$CLIPS_DIR"/*; do
+  case "$f" in *.mp4|*.mov|*.m4v|*.mkv) clips+=("$f") ;; esac
+  [ "${#clips[@]}" -ge 9 ] && break
+done
+
+if [ "$CLIPS_ONLY" = 1 ]; then
+  # Fail now rather than after the stream is up: a bad clip would mean
+  # nothing to show, and there's no camera to fall back to.
+  for f in "$FALLBACK" ${clips[@]+"${clips[@]}"}; do
+    if [ ! -f "$f" ]; then
+      echo "--clips-only needs a fallback clip, and there's none at $FALLBACK" >&2
+      echo "(make one with make-fallback.sh, or set FALLBACK=...)" >&2
+      exit 1
+    fi
+    if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_type \
+         -of csv=p=0 "$f" 2>/dev/null | grep -q video; then
+      echo "--clips-only: no readable video in $f" >&2
+      exit 1
+    fi
+  done
+  echo "Clips only (no camera), streaming ${OUT_WIDTH}x${OUT_HEIGHT}@${FPS} to ${PI_HOST}:${PORT}"
+  echo "Audio device index: $AUDIO_IDX"
+else
+  echo "Capturing ${WIDTH}x${HEIGHT}, streaming ${OUT_WIDTH}x${OUT_HEIGHT}@${FPS} to ${PI_HOST}:${PORT}"
+  echo "Video device index: $VIDEO_IDX   Audio device index: $AUDIO_IDX"
+fi
 
 fit="scale=${OUT_WIDTH}:${OUT_HEIGHT}:force_original_aspect_ratio=increase,crop=${OUT_WIDTH}:${OUT_HEIGHT},setsar=1,format=yuv420p"
 camera=(-f avfoundation -framerate "$FPS" -video_size "${WIDTH}x${HEIGHT}"
         -pixel_format uyvy422 -i "${VIDEO_IDX}:${AUDIO_IDX}")
+[ "$CLIPS_ONLY" = 1 ] && camera=(-f avfoundation -i ":${AUDIO_IDX}")   # mic only
 # A keyframe every second: the Pi restarts its decoder when the host switches
 # camera modes, and a lost UDP packet only corrupts video until the next one.
 output=(-c:v h264_videotoolbox -b:v "$VBITRATE" -g "$FPS" -realtime 1
@@ -82,15 +123,10 @@ case "$START" in
   fallback) map=1 ;;
   *)        map=0 ;;
 esac
+[ "$CLIPS_ONLY" = 1 ] && map=1
 TMP="$(mktemp -d)"
 mkfifo "$TMP/cmd"
 LOG="$TMP/ffmpeg.log"
-
-clips=()
-for f in "$CLIPS_DIR"/*; do
-  case "$f" in *.mp4|*.mov|*.m4v|*.mkv) clips+=("$f") ;; esac
-  [ "${#clips[@]}" -ge 9 ] && break
-done
 
 FEEDER=""
 if [ "${#clips[@]}" -gt 0 ]; then
@@ -108,10 +144,16 @@ else
   clip_in=(-re -stream_loop -1 -i "$FALLBACK")
 fi
 
+if [ "$CLIPS_ONLY" = 1 ]; then   # input 0 is the mic alone: no camera to select
+  graph="[1:v]setpts=PTS-STARTPTS,${fit},fps=${FPS}[v]"
+else
+  graph="[0:v]setpts=PTS-STARTPTS,${fit}[cam];[1:v]setpts=PTS-STARTPTS,${fit}[clip];
+         [cam][clip]streamselect=inputs=2:map=${map},fps=${FPS}[v]"
+fi
+
 ffmpeg -hide_banner -loglevel warning -nostats "${camera[@]}" \
   "${clip_in[@]}" \
-  -filter_complex "[0:v]setpts=PTS-STARTPTS,${fit}[cam];[1:v]setpts=PTS-STARTPTS,${fit}[clip];
-                   [cam][clip]streamselect=inputs=2:map=${map},fps=${FPS}[v]" \
+  -filter_complex "$graph" \
   -map '[v]' "${output[@]}" <"$TMP/cmd" 2>"$LOG" &
 FFMPEG=$!
 exec 3>"$TMP/cmd"   # hold the FIFO open, or ffmpeg sees EOF
@@ -131,6 +173,8 @@ trap 'exit 130' INT TERM
 
 clip_keys=""
 [ "${#clips[@]}" -gt 0 ] && clip_keys="  [1-${#clips[@]}] clip"
+live_key="[l] live  "
+[ "$CLIPS_ONLY" = 1 ] && live_key=""
 shown=""
 status() {
   local playing=""
@@ -138,8 +182,11 @@ status() {
   if [ "$map" = 0 ]; then
     printf '\r\033[K\033[1;32m● LIVE\033[0m camera     [f] fallback%s  [space] toggle  [q] quit' "$clip_keys"
   elif [ "${playing#clip }" != "$playing" ]; then
-    printf '\r\033[K\033[1;35m▶ CLIP %s\033[0m %s     [l] live%s  [q] quit' \
-      "${playing#clip }" "$(basename "${clips[${playing#clip }-1]}")" "$clip_keys"
+    printf '\r\033[K\033[1;35m▶ CLIP %s\033[0m %s     %s%s  [q] quit' \
+      "${playing#clip }" "$(basename "${clips[${playing#clip }-1]}")" "$live_key" "${clip_keys#  }"
+  elif [ "$CLIPS_ONLY" = 1 ]; then
+    printf '\r\033[K\033[1;33m● CLIPS ONLY\033[0m %s     %s  [q] quit' \
+      "$(basename "$FALLBACK")" "${clip_keys#  }"
   else
     printf '\r\033[K\033[1;33m● FALLBACK\033[0m %s     [l] live%s  [space] toggle  [q] quit' \
       "$(basename "$FALLBACK")" "$clip_keys"
@@ -154,6 +201,7 @@ feeder() {   # send a command to clipfeed.py
 
 select_source() {
   [ "$1" = "$map" ] && return
+  [ "$CLIPS_ONLY" = 1 ] && return   # there's no camera to switch to
   map="$1"
   [ "$map" = 0 ] && feeder stop
   printf 'cstreamselect -1 map %s\n' "$map" >&3
