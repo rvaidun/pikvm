@@ -25,6 +25,11 @@
 # works too). MIC_START=clip starts on the clip's audio. The clip audio
 # follows the clip even while the picture is live.
 #
+# s syncs the mic to the picture: the audio switches right away to match
+# (live camera -> live mic, clip -> clip audio) and then follows every
+# picture switch (f, l, space, 1-9). m while synced unsyncs and flips the
+# mic; s again unsyncs. SYNC=1 starts synced.
+#
 # One-shot clips: video files in CLIPS_DIR (default clips/ next to this
 # script) get keys 1-9 in name order (name them 1-wave.mp4, 2-nod.mp4, ...).
 # A key plays that clip once from the start, then the base fallback clip
@@ -77,6 +82,7 @@ ABITRATE="${ABITRATE:-128k}"
 FALLBACK="${FALLBACK:-$HERE/fallback.mp4}"
 START="${START:-live}"
 MIC_START="${MIC_START:-live}"
+SYNC="${SYNC:-0}"
 # Started from live, a one-shot clip holds its first frame this long, so the
 # switch (which takes ffmpeg ~0.2 s) doesn't cut off its start.
 PREROLL_FRAMES="${PREROLL_FRAMES:-$((FPS / 5 + 1))}"
@@ -219,6 +225,7 @@ case "$MIC_START" in
   *)    amap=0 ;;
 esac
 [ "$CLIPS_ONLY" = 1 ] && map=1
+[ "$SYNC" = 1 ] && amap="$map"
 TMP="$(mktemp -d)"
 mkfifo "$TMP/cmd" "$TMP/clip.yuv" "$TMP/clip.pcm" "$TMP/ctl"
 LOG="$TMP/ffmpeg.log"
@@ -260,7 +267,7 @@ live_key="[l] live  "
 [ "$CLIPS_ONLY" = 1 ] && live_key=""
 shown=""
 status() {
-  local playing video mic
+  local playing video mic sync
   playing="$(cat "$TMP/state" 2>/dev/null || true)"
   if [ "$map" = 0 ]; then
     video="$(printf '\033[1;32m● LIVE\033[0m camera     [f] fallback%s  [space] toggle' "$clip_keys")"
@@ -278,8 +285,13 @@ status() {
   else
     mic="$(printf '\033[1;33m🔊 CLIP AUDIO\033[0m [m] live mic')"
   fi
-  printf '\r\033[K%s  |  %s  [q] quit' "$video" "$mic"
-  shown="$map $amap $playing"
+  if [ "$SYNC" = 1 ]; then
+    sync="$(printf '\033[1;36m🔗 SYNCED\033[0m [s] unsync')"
+  else
+    sync="[s] sync"
+  fi
+  printf '\r\033[K%s  |  %s  %s  [q] quit' "$video" "$mic" "$sync"
+  shown="$map $amap $SYNC $playing"
 }
 
 feeder() {   # send a command to clipfeed.py
@@ -293,6 +305,7 @@ select_source() {
   map="$1"
   [ "$map" = 0 ] && feeder stop
   printf 'cstreamselect -1 map %s\n' "$map" >&3
+  [ "$SYNC" = 1 ] && select_audio "$map"
   status
 }
 
@@ -321,17 +334,18 @@ echo
 status
 while kill -0 "$FFMPEG" 2>/dev/null; do
   key=""
-  read -rsn1 -t 1 key || true
+  IFS= read -rsn1 -t 1 key || true   # IFS= or a space reads as nothing
   case "$key" in
     f|F) select_source 1 ;;
     l|L) select_source 0 ;;
     " ") select_source $((1 - map)) ;;
-    m|M) select_audio $((1 - amap)) ;;
+    m|M) SYNC=0; select_audio $((1 - amap)); status ;;
+    s|S) if [ "$SYNC" = 1 ]; then SYNC=0; else SYNC=1; select_audio "$map"; fi; status ;;
     [1-9]) play_clip "$key" ;;
     q|Q) exit 0 ;;
   esac
   # A clip ending changes the state file; keep the status line in step.
-  [ "$shown" != "$map $amap $(cat "$TMP/state" 2>/dev/null)" ] && status
+  [ "$shown" != "$map $amap $SYNC $(cat "$TMP/state" 2>/dev/null)" ] && status
 done
 
 printf '\n'

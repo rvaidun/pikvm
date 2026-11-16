@@ -143,7 +143,9 @@ changes: the target just sees one camera.
 The mic switches on its own: **m** toggles the target's mic between the live
 mic and the clip's audio (in sync with the clip; silent if it has none). So
 live camera + live mic, clip + live mic and clip + clip audio are each a key
-away. `MIC_START=clip` starts on the clip's audio.
+away. `MIC_START=clip` starts on the clip's audio. **s** syncs the mic to the
+picture (live camera ↔ live mic, clip ↔ clip audio) until you press **s** or
+**m** again; `SYNC=1` starts synced.
 
 One-shot clips in `macforward/mac/clips/` get keys **1**–**9** in name order
 (`1-wave.mp4`, `2-nod.mp4`, ...): each plays once, sound and all, then the
