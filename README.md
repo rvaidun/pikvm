@@ -136,18 +136,33 @@ using the same camera), then turn the recording into a clip once:
 
 With `fallback.mp4` present, press **f** for the clip, **l** for the live
 camera, **space** to toggle, and **q** to quit. `START=fallback` starts on the clip,
-and `FALLBACK=<file>` uses a different one. The mic stays live the whole time.
-Both sources go through the same ffmpeg and the same stream, so the switch
-is instant and the Pi needs no changes: the target just sees one camera.
+and `FALLBACK=<file>` uses a different one. Both sources go through the same
+ffmpeg and the same stream, so the switch is instant and the Pi needs no
+changes: the target just sees one camera.
 
-`make-fallback.sh` matches the clip to the live stream (640×360, 30 fps, no
-audio, metadata stripped) and hides the loop seam. `LOOP=auto` (the default)
+The mic switches on its own: **m** toggles the target's mic between the live
+mic and the clip's audio (in sync with the clip; silent if it has none). So
+live camera + live mic, clip + live mic and clip + clip audio are each a key
+away. `MIC_START=clip` starts on the clip's audio.
+
+One-shot clips in `macforward/mac/clips/` get keys **1**–**9** in name order
+(`1-wave.mp4`, `2-nod.mp4`, ...): each plays once, sound and all, then the
+fallback loop picks up where it left off. Make one with
+`LOOP=none ./make-fallback.sh <recording> clips/1-wave.mp4`. `--clips-only`
+never opens the camera.
+
+Only one `forward.sh` runs at a time: a second one refuses and says which is
+running. `./forward.sh --force <pi-ip>` stops the running one and takes over.
+
+`make-fallback.sh` matches the clip to the live stream (640×360, 30 fps, 48 kHz
+stereo audio, metadata stripped) and hides the loop seam. `LOOP=auto` (the default)
 searches the start and end of the recording for the two moments where you're
 in the same pose and moving the same way, cuts the loop there and dissolves
-over half a second, so your head ends where it started. `LOOP=pingpong` plays
+over half a second, so your head ends where it started; the audio is cut at
+the same frames and crossfades over the dissolve. `LOOP=pingpong` plays
 forward then backward (no jump at all, but odd if you talk or gesture);
 `LOOP=crossfade` dissolves the last second into the first wherever they are.
-`START`/`DURATION` trim the recording.
+`START`/`DURATION` trim the recording; `AUDIO=none` drops the sound.
 
 ---
 

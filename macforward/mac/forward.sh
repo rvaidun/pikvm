@@ -2,7 +2,7 @@
 # Mac webcam + mic -> H.264/AAC MPEG-TS over UDP -> Pi
 #
 # Usage:
-#   ./forward.sh [--clips-only] [pi-host]
+#   ./forward.sh [--clips-only] [--force] [pi-host]
 #   PORT=1234 OUT_WIDTH=640 OUT_HEIGHT=360 FPS=30 ./forward.sh 192.168.1.8
 #
 # The camera is captured at WIDTH x HEIGHT (a mode it supports) and scaled
@@ -14,23 +14,33 @@
 # Fallback video: with a clip at FALLBACK (default fallback.mp4 next to this
 # script; make one with make-fallback.sh), keys switch the picture while it
 # runs: f = fallback clip (looped), l = live camera, space = toggle, q = quit.
-# START=fallback starts on the clip. The mic stays live either way. Both
-# sources run in the same ffmpeg and output stream, so the switch is
-# instant and the Pi sees one continuous camera.
+# START=fallback starts on the clip. Both sources run in the same ffmpeg and
+# output stream, so the switch is instant and the Pi sees one continuous
+# camera. clipfeed.py (python3) plays the clips.
+#
+# Audio switches on its own: m toggles the target's mic between the live
+# mic and the clip's audio (the sound of whichever clip is on, in sync with
+# it; silent if the clip has none). So live camera + live mic, clip + live
+# mic and clip + clip audio are all a key away (live camera + clip audio
+# works too). MIC_START=clip starts on the clip's audio. The clip audio
+# follows the clip even while the picture is live.
 #
 # One-shot clips: video files in CLIPS_DIR (default clips/ next to this
 # script) get keys 1-9 in name order (name them 1-wave.mp4, 2-nod.mp4, ...).
 # A key plays that clip once from the start, then the base fallback clip
 # picks up again where it left off. Pressing one while live switches to the
 # clip too, so it also ends on the fallback; l goes back to the camera (and
-# cuts a clip short). clipfeed.py (python3) feeds the base clip and the
-# one-shot clips to ffmpeg as one stream. Make a clip with mkdir clips and
+# cuts a clip short). Make a clip with mkdir clips and
 # LOOP=none ./make-fallback.sh <recording> clips/1-wave.mp4
 #
 # --clips-only (or --no-live): never send the camera. The camera isn't even
-# opened; the picture is the fallback clip and the one-shot clips, and only
-# the mic is live. It exits at once if the fallback clip or a one-shot clip
-# is missing or unreadable.
+# opened; the picture is the fallback clip and the one-shot clips, and the
+# audio is the mic or the clip's audio (m). It exits at once if the fallback
+# clip or a one-shot clip is missing or unreadable.
+#
+# Only one forward.sh runs at a time: a second one refuses to start and says
+# which is running. --force (or --override) stops the running one and takes
+# over.
 #
 # Devices (from `ffmpeg -f avfoundation -list_devices true -i ""`):
 #   video 0 = MacBook Pro Camera
@@ -42,10 +52,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLIPS_ONLY=0
+FORCE=0
 PI_HOST=""
 for arg in "$@"; do
   case "$arg" in
     --clips-only|--no-live) CLIPS_ONLY=1 ;;
+    --force|--override) FORCE=1 ;;
     -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "Unknown option: $arg (see --help)" >&2; exit 2 ;;
     *)  PI_HOST="$arg" ;;
@@ -64,11 +76,83 @@ VBITRATE="${VBITRATE:-2M}"
 ABITRATE="${ABITRATE:-128k}"
 FALLBACK="${FALLBACK:-$HERE/fallback.mp4}"
 START="${START:-live}"
+MIC_START="${MIC_START:-live}"
 # Started from live, a one-shot clip holds its first frame this long, so the
 # switch (which takes ffmpeg ~0.2 s) doesn't cut off its start.
 PREROLL_FRAMES="${PREROLL_FRAMES:-$((FPS / 5 + 1))}"
 CLIPS_DIR="${CLIPS_DIR:-$HERE/clips}"
 
+# --- One at a time -------------------------------------------------------
+# The lock is a directory (mkdir is atomic) holding our pid and, once they
+# start, the pids of our ffmpeg and clipfeed, so a takeover can clear them
+# out even if the old forward.sh was killed without cleaning up.
+LOCK="/tmp/macforward.$(id -u).lock"
+
+is_ours() {   # is pid $1 alive and running command matching $2
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null &&
+    ps -p "$1" -o command= 2>/dev/null | grep -q -e "$2"
+}
+
+kill_leftovers() {   # the old run's ffmpeg / clipfeed, if still running
+  local p
+  for p in $(cat "$LOCK/children" 2>/dev/null); do
+    is_ours "$p" 'ffmpeg\|clipfeed' && kill "$p" 2>/dev/null || true
+  done
+}
+
+take_lock() {
+  local tries pid _
+  for tries in 1 2 3 4 5 6 7 8 9 10; do
+    if mkdir "$LOCK" 2>/dev/null; then
+      echo $$ >"$LOCK/pid"
+      return 0
+    fi
+    pid="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then   # another one is starting this instant
+      sleep 0.2
+      continue
+    fi
+    if is_ours "$pid" forward.sh; then
+      if [ "$FORCE" = 0 ]; then
+        echo "forward.sh is already running (pid $pid, started $(ps -p "$pid" -o lstart= | sed 's/^ *//; s/ *$//'))." >&2
+        echo "Quit it there (q or Ctrl-C), or run with --force to stop it and take over." >&2
+        exit 1
+      fi
+      echo "Stopping the forward.sh already running (pid $pid)..."
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    # Gone (or stale from a run that died): clear what it left and retry.
+    kill_leftovers
+    [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$pid" ] && rm -rf "$LOCK"
+  done
+  echo "Couldn't take the lock at $LOCK; remove it if no forward.sh is running." >&2
+  exit 1
+}
+take_lock
+
+FFMPEG=""
+FEEDER=""
+TMP=""
+cleanup() {
+  printf '\n'
+  if [ -n "$FFMPEG" ] && kill -0 "$FFMPEG" 2>/dev/null; then
+    # Let ffmpeg finish cleanly: q on its command FIFO, or else a TERM.
+    { printf 'q' >&3; } 2>/dev/null || kill "$FFMPEG" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$FFMPEG" 2>/dev/null || break; sleep 0.2; done
+    kill "$FFMPEG" 2>/dev/null || true
+  fi
+  [ -n "$FEEDER" ] && kill "$FEEDER" 2>/dev/null || true
+  [ -n "$TMP" ] && rm -rf "$TMP"
+  [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = $$ ] && rm -rf "$LOCK"
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'printf "\nStopped (another forward.sh --force took over, or killed)."; exit 143' TERM
+
+# --- Sources -------------------------------------------------------------
 clips=()
 for f in "$CLIPS_DIR"/*; do
   case "$f" in *.mp4|*.mov|*.m4v|*.mkv) clips+=("$f") ;; esac
@@ -98,86 +182,77 @@ else
 fi
 
 fit="scale=${OUT_WIDTH}:${OUT_HEIGHT}:force_original_aspect_ratio=increase,crop=${OUT_WIDTH}:${OUT_HEIGHT},setsar=1,format=yuv420p"
+afit="aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
 camera=(-f avfoundation -framerate "$FPS" -video_size "${WIDTH}x${HEIGHT}"
         -pixel_format uyvy422 -i "${VIDEO_IDX}:${AUDIO_IDX}")
 [ "$CLIPS_ONLY" = 1 ] && camera=(-f avfoundation -i ":${AUDIO_IDX}")   # mic only
 # A keyframe every second: the Pi restarts its decoder when the host switches
 # camera modes, and a lost UDP packet only corrupts video until the next one.
 output=(-c:v h264_videotoolbox -b:v "$VBITRATE" -g "$FPS" -realtime 1
-        -map 0:a -c:a aac -b:a "$ABITRATE" -ar 48000 -ac 2
+        -c:a aac -b:a "$ABITRATE" -ar 48000 -ac 2
         -f mpegts "udp://${PI_HOST}:${PORT}?pkt_size=1316")
 
 if [ ! -f "$FALLBACK" ]; then
   echo "No fallback clip at $FALLBACK; streaming the camera only. Press Ctrl-C to stop."
   echo
-  exec ffmpeg -hide_banner -loglevel info "${camera[@]}" \
-    -map 0:v -vf "$fit" "${output[@]}"
+  # In the background so a TERM (a --force takeover) runs cleanup at once.
+  ffmpeg -hide_banner -loglevel info -nostdin "${camera[@]}" \
+    -map 0:v -vf "$fit" -map 0:a "${output[@]}" &
+  FFMPEG=$!
+  echo "$FFMPEG" >"$LOCK/children"
+  wait "$FFMPEG" || exit $?
+  exit 0
 fi
 
-# Both sources feed streamselect; ffmpeg reads filter commands from its stdin
-# ("c<target> <time> <command> <arg>\n"), so a FIFO lets the key loop below
-# flip streamselect's map without restarting anything. The clip plays (and
-# loops) in the background while live, so it never starts from frame one.
-# Both are rebased to t=0 and run in real time, which keeps them in step.
+# Both video sources feed streamselect and both audio sources astreamselect;
+# ffmpeg reads filter commands from its stdin ("c<target> <time> <command>
+# <arg>\n"), so a FIFO lets the key loop below flip their maps without
+# restarting anything. clipfeed.py plays the clip (and its audio) in the
+# background while live, so it never starts from frame one. Everything is
+# rebased to t=0 and runs in real time, which keeps it in step.
 case "$START" in
   fallback) map=1 ;;
   *)        map=0 ;;
 esac
+case "$MIC_START" in
+  clip) amap=1 ;;
+  *)    amap=0 ;;
+esac
 [ "$CLIPS_ONLY" = 1 ] && map=1
 TMP="$(mktemp -d)"
-mkfifo "$TMP/cmd"
+mkfifo "$TMP/cmd" "$TMP/clip.yuv" "$TMP/clip.pcm" "$TMP/ctl"
 LOG="$TMP/ffmpeg.log"
 
-FEEDER=""
-if [ "${#clips[@]}" -gt 0 ]; then
-  # The feeder writes the clip source as raw frames into a FIFO, playing
-  # the base clip on a loop and a one-shot clip whenever it's told to.
-  mkfifo "$TMP/clip.yuv" "$TMP/ctl"
-  echo base >"$TMP/state"
-  python3 "$HERE/clipfeed.py" "$OUT_WIDTH" "$OUT_HEIGHT" "$FPS" \
-    "$TMP/ctl" "$TMP/state" "$FALLBACK" "${clips[@]}" \
-    >"$TMP/clip.yuv" 2>"$TMP/clipfeed.log" &
-  FEEDER=$!
-  clip_in=(-f rawvideo -pix_fmt yuv420p -video_size "${OUT_WIDTH}x${OUT_HEIGHT}"
-           -framerate "$FPS" -i "$TMP/clip.yuv")
-else
-  # Loop through the concat demuxer, the clip listed 1000 times, rather than
-  # -stream_loop alone: with -re, each -stream_loop wrap stalled the stream
-  # ~0.5 s and then burst, longer than the Pi's jitter buffer, so the loop
-  # point froze and skipped. Concat goes on to the next copy without the
-  # stall; -stream_loop only has to cover the (hours-long) list.
-  esc="$(printf '%s' "$FALLBACK" | sed "s/'/'\\\\''/g")"
-  { echo "ffconcat version 1.0"
-    for _ in $(seq 1000); do echo "file '$esc'"; done; } >"$TMP/loop.ffconcat"
-  clip_in=(-re -f concat -safe 0 -stream_loop -1 -i "$TMP/loop.ffconcat")
-fi
+# The feeder writes the clip's frames and audio into FIFOs, playing the base
+# clip on a loop and a one-shot clip whenever it's told to.
+echo base >"$TMP/state"
+python3 "$HERE/clipfeed.py" "$OUT_WIDTH" "$OUT_HEIGHT" "$FPS" \
+  "$TMP/ctl" "$TMP/state" "$TMP/clip.pcm" "$FALLBACK" ${clips[@]+"${clips[@]}"} \
+  2>"$TMP/clipfeed.log" >"$TMP/clip.yuv" &   # stderr first: the FIFO open can fail
+FEEDER=$!
+clip_in=(-f rawvideo -pix_fmt yuv420p -video_size "${OUT_WIDTH}x${OUT_HEIGHT}"
+         -framerate "$FPS" -i "$TMP/clip.yuv"
+         -f s16le -ar 48000 -ac 2 -i "$TMP/clip.pcm")
 
+# The two audio sources' clocks are a few tens of ms apart, so the switch
+# would step the timestamps back (or skip ahead); aresample trims or fills
+# the switch point to keep the output continuous.
+audio_graph="[0:a]${afit},asetpts=PTS-STARTPTS[mic];[2:a]${afit},asetpts=PTS-STARTPTS[clipa];
+             [mic][clipa]astreamselect=inputs=2:map=${amap},aresample=async=1[a]"
 if [ "$CLIPS_ONLY" = 1 ]; then   # input 0 is the mic alone: no camera to select
-  graph="[1:v]setpts=PTS-STARTPTS,${fit},fps=${FPS}[v]"
+  graph="[1:v]setpts=PTS-STARTPTS,${fit},fps=${FPS}[v];${audio_graph}"
 else
   graph="[0:v]setpts=PTS-STARTPTS,${fit}[cam];[1:v]setpts=PTS-STARTPTS,${fit}[clip];
-         [cam][clip]streamselect=inputs=2:map=${map},fps=${FPS}[v]"
+         [cam][clip]streamselect=inputs=2:map=${map},fps=${FPS}[v];${audio_graph}"
 fi
 
 ffmpeg -hide_banner -loglevel warning -nostats "${camera[@]}" \
   "${clip_in[@]}" \
   -filter_complex "$graph" \
-  -map '[v]' "${output[@]}" <"$TMP/cmd" 2>"$LOG" &
+  -map '[v]' -map '[a]' "${output[@]}" <"$TMP/cmd" 2>"$LOG" &
 FFMPEG=$!
+echo "$FFMPEG $FEEDER" >"$LOCK/children"
 exec 3>"$TMP/cmd"   # hold the FIFO open, or ffmpeg sees EOF
-
-cleanup() {
-  printf '\n'
-  if kill -0 "$FFMPEG" 2>/dev/null; then
-    printf 'q' >&3 2>/dev/null || true       # let ffmpeg finish cleanly
-    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$FFMPEG" 2>/dev/null || break; sleep 0.2; done
-    kill "$FFMPEG" 2>/dev/null || true
-  fi
-  [ -n "$FEEDER" ] && kill "$FEEDER" 2>/dev/null || true
-  rm -rf "$TMP"
-}
-trap cleanup EXIT
-trap 'exit 130' INT TERM
 
 clip_keys=""
 [ "${#clips[@]}" -gt 0 ] && clip_keys="  [1-${#clips[@]}] clip"
@@ -185,25 +260,30 @@ live_key="[l] live  "
 [ "$CLIPS_ONLY" = 1 ] && live_key=""
 shown=""
 status() {
-  local playing=""
-  [ -n "$FEEDER" ] && playing="$(cat "$TMP/state" 2>/dev/null || true)"
+  local playing video mic
+  playing="$(cat "$TMP/state" 2>/dev/null || true)"
   if [ "$map" = 0 ]; then
-    printf '\r\033[K\033[1;32m● LIVE\033[0m camera     [f] fallback%s  [space] toggle  [q] quit' "$clip_keys"
+    video="$(printf '\033[1;32m● LIVE\033[0m camera     [f] fallback%s  [space] toggle' "$clip_keys")"
   elif [ "${playing#clip }" != "$playing" ]; then
-    printf '\r\033[K\033[1;35m▶ CLIP %s\033[0m %s     %s%s  [q] quit' \
-      "${playing#clip }" "$(basename "${clips[${playing#clip }-1]}")" "$live_key" "${clip_keys#  }"
+    video="$(printf '\033[1;35m▶ CLIP %s\033[0m %s     %s%s' \
+      "${playing#clip }" "$(basename "${clips[${playing#clip }-1]}")" "$live_key" "${clip_keys#  }")"
   elif [ "$CLIPS_ONLY" = 1 ]; then
-    printf '\r\033[K\033[1;33m● CLIPS ONLY\033[0m %s     %s  [q] quit' \
-      "$(basename "$FALLBACK")" "${clip_keys#  }"
+    video="$(printf '\033[1;33m● CLIPS ONLY\033[0m %s     %s' "$(basename "$FALLBACK")" "${clip_keys#  }")"
   else
-    printf '\r\033[K\033[1;33m● FALLBACK\033[0m %s     [l] live%s  [space] toggle  [q] quit' \
-      "$(basename "$FALLBACK")" "$clip_keys"
+    video="$(printf '\033[1;33m● FALLBACK\033[0m %s     [l] live%s  [space] toggle' \
+      "$(basename "$FALLBACK")" "$clip_keys")"
   fi
-  shown="$map $playing"
+  if [ "$amap" = 0 ]; then
+    mic="$(printf '\033[1;32m🎤 LIVE MIC\033[0m [m] clip audio')"
+  else
+    mic="$(printf '\033[1;33m🔊 CLIP AUDIO\033[0m [m] live mic')"
+  fi
+  printf '\r\033[K%s  |  %s  [q] quit' "$video" "$mic"
+  shown="$map $amap $playing"
 }
 
 feeder() {   # send a command to clipfeed.py
-  [ -n "$FEEDER" ] && kill -0 "$FEEDER" 2>/dev/null && printf '%s\n' "$1" >"$TMP/ctl"
+  kill -0 "$FEEDER" 2>/dev/null && printf '%s\n' "$1" >"$TMP/ctl"
   return 0
 }
 
@@ -213,6 +293,13 @@ select_source() {
   map="$1"
   [ "$map" = 0 ] && feeder stop
   printf 'cstreamselect -1 map %s\n' "$map" >&3
+  status
+}
+
+select_audio() {
+  [ "$1" = "$amap" ] && return
+  amap="$1"
+  printf 'castreamselect -1 map %s\n' "$amap" >&3
   status
 }
 
@@ -239,14 +326,16 @@ while kill -0 "$FFMPEG" 2>/dev/null; do
     f|F) select_source 1 ;;
     l|L) select_source 0 ;;
     " ") select_source $((1 - map)) ;;
+    m|M) select_audio $((1 - amap)) ;;
     [1-9]) play_clip "$key" ;;
     q|Q) exit 0 ;;
   esac
   # A clip ending changes the state file; keep the status line in step.
-  [ -n "$FEEDER" ] && [ "$shown" != "$map $(cat "$TMP/state" 2>/dev/null)" ] && status
+  [ "$shown" != "$map $amap $(cat "$TMP/state" 2>/dev/null)" ] && status
 done
 
 printf '\n'
 echo "ffmpeg exited:" >&2
 grep -v -e '^Enter command' -e '^Command reply' -e '^$' "$LOG" | tail -20 >&2
+[ -s "$TMP/clipfeed.log" ] && { echo "clipfeed:" >&2; tail -10 "$TMP/clipfeed.log" >&2; }
 exit 1
