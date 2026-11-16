@@ -142,7 +142,7 @@ FFMPEG=""
 FEEDER=""
 TMP=""
 cleanup() {
-  printf '\n'
+  printf '\033[?7h\n'   # line wrap back on
   if [ -n "$FFMPEG" ] && kill -0 "$FFMPEG" 2>/dev/null; then
     # Let ffmpeg finish cleanly: q on its command FIFO, or else a TERM.
     { printf 'q' >&3; } 2>/dev/null || kill "$FFMPEG" 2>/dev/null || true
@@ -261,36 +261,37 @@ FFMPEG=$!
 echo "$FFMPEG $FEEDER" >"$LOCK/children"
 exec 3>"$TMP/cmd"   # hold the FIFO open, or ffmpeg sees EOF
 
-clip_keys=""
-[ "${#clips[@]}" -gt 0 ] && clip_keys="  [1-${#clips[@]}] clip"
-live_key="[l] live  "
-[ "$CLIPS_ONLY" = 1 ] && live_key=""
+# The keys are listed once at startup, so the status line stays short
+# enough not to wrap (a wrapped line can't be redrawn in place with \r).
+keys="[f] fallback  [l] live  [space] toggle"
+[ "$CLIPS_ONLY" = 1 ] && keys=""
+case "${#clips[@]}" in
+  0) ;;
+  1) keys="${keys:+$keys  }[1] clip" ;;
+  *) keys="${keys:+$keys  }[1-${#clips[@]}] clips" ;;
+esac
+keys="$keys  [m] mic  [s] sync  [q] quit"
 shown=""
 status() {
-  local playing video mic sync
+  local playing video mic sync=""
   playing="$(cat "$TMP/state" 2>/dev/null || true)"
   if [ "$map" = 0 ]; then
-    video="$(printf '\033[1;32m● LIVE\033[0m camera     [f] fallback%s  [space] toggle' "$clip_keys")"
+    video=$'\033[1;32m● LIVE\033[0m camera'
   elif [ "${playing#clip }" != "$playing" ]; then
-    video="$(printf '\033[1;35m▶ CLIP %s\033[0m %s     %s%s' \
-      "${playing#clip }" "$(basename "${clips[${playing#clip }-1]}")" "$live_key" "${clip_keys#  }")"
+    video="$(printf '\033[1;35m▶ CLIP %s\033[0m %s' \
+      "${playing#clip }" "$(basename "${clips[${playing#clip }-1]}")")"
   elif [ "$CLIPS_ONLY" = 1 ]; then
-    video="$(printf '\033[1;33m● CLIPS ONLY\033[0m %s     %s' "$(basename "$FALLBACK")" "${clip_keys#  }")"
+    video="$(printf '\033[1;33m● CLIPS ONLY\033[0m %s' "$(basename "$FALLBACK")")"
   else
-    video="$(printf '\033[1;33m● FALLBACK\033[0m %s     [l] live%s  [space] toggle' \
-      "$(basename "$FALLBACK")" "$clip_keys")"
+    video="$(printf '\033[1;33m● FALLBACK\033[0m %s' "$(basename "$FALLBACK")")"
   fi
   if [ "$amap" = 0 ]; then
-    mic="$(printf '\033[1;32m🎤 LIVE MIC\033[0m [m] clip audio')"
+    mic=$'\033[1;32m🎤 live mic\033[0m'
   else
-    mic="$(printf '\033[1;33m🔊 CLIP AUDIO\033[0m [m] live mic')"
+    mic=$'\033[1;33m🔊 clip audio\033[0m'
   fi
-  if [ "$SYNC" = 1 ]; then
-    sync="$(printf '\033[1;36m🔗 SYNCED\033[0m [s] unsync')"
-  else
-    sync="[s] sync"
-  fi
-  printf '\r\033[K%s  |  %s  %s  [q] quit' "$video" "$mic" "$sync"
+  [ "$SYNC" = 1 ] && sync=$'  \033[1;36m🔗 synced\033[0m'
+  printf '\r\033[K%s   %s%s' "$video" "$mic" "$sync"
   shown="$map $amap $SYNC $playing"
 }
 
@@ -330,7 +331,10 @@ play_clip() {
 echo "Fallback clip: $FALLBACK"
 i=0
 while [ "$i" -lt "${#clips[@]}" ]; do echo "  [$((i + 1))] $(basename "${clips[$i]}")"; i=$((i + 1)); done
+echo "$keys"
 echo
+printf '\033[?7l'   # no line wrap while the status line is up: a narrow
+                    # window cuts it off instead of starting a new line
 status
 while kill -0 "$FFMPEG" 2>/dev/null; do
   key=""
