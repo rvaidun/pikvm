@@ -55,6 +55,26 @@ To list cameras + mics on the Mac:
 ffmpeg -f avfoundation -list_devices true -i ""
 ```
 
+## Menubar preview + controls
+
+`mac/preview/` is a small menubar app, **MacForward Preview**, that shows the
+picture forward.sh is sending and works its keys (live / fallback, clips 1-9,
+mic, sync, stop) with buttons.
+
+```
+cd ~/GitProjects/pikvm/macforward/mac/preview
+./build.sh --install     # builds, copies to ~/Applications, launches
+```
+
+Click the menubar icon for the preview; right-click for a menu with
+**Open Window** (a resizable window that stays on top, pin to toggle).
+Double-clicking the popover's picture opens the window too. Needs only the
+Xcode command line tools (`swiftc`).
+
+forward.sh writes a small JPEG of the outgoing picture and a status file to
+`/tmp/macforward.<uid>.lock/` while it runs (`PREVIEW=0` turns that off),
+and takes keys from the app as lines in `requests` there plus a USR1.
+
 ## Troubleshooting
 
 - **Windows doesn't see the camera**: check `dmesg | grep dwc2` on the Pi — if it says "mode: host", the OTG overlay isn't active. Confirm `dtoverlay=dwc2` is in `/boot/firmware/config.txt` and reboot.

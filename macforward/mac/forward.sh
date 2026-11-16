@@ -43,6 +43,13 @@
 # audio is the mic or the clip's audio (m). It exits at once if the fallback
 # clip or a one-shot clip is missing or unreadable.
 #
+# Preview: while it runs, the picture being sent is also written, small, to
+# $LOCK/preview.jpg (PREVIEW_FPS a second, PREVIEW_WIDTH wide) and what's on
+# to $LOCK/status, for the menubar app in preview/ (MacForward Preview).
+# PREVIEW=0 turns it off. The app also works the keys: it appends them, one
+# a line, to $LOCK/requests and sends a USR1, and they're handled just as if
+# typed here (bash runs the trap even while it waits for a key).
+#
 # Only one forward.sh runs at a time: a second one refuses to start and says
 # which is running. --force (or --override) stops the running one and takes
 # over.
@@ -87,6 +94,9 @@ SYNC="${SYNC:-0}"
 # switch (which takes ffmpeg ~0.2 s) doesn't cut off its start.
 PREROLL_FRAMES="${PREROLL_FRAMES:-$((FPS / 5 + 1))}"
 CLIPS_DIR="${CLIPS_DIR:-$HERE/clips}"
+PREVIEW="${PREVIEW:-1}"
+PREVIEW_FPS="${PREVIEW_FPS:-15}"
+PREVIEW_WIDTH="${PREVIEW_WIDTH:-640}"
 
 # --- One at a time -------------------------------------------------------
 # The lock is a directory (mkdir is atomic) holding our pid and, once they
@@ -156,7 +166,18 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT
-trap 'printf "\nStopped (another forward.sh --force took over, or killed)."; exit 143' TERM
+trap '' USR1   # the menubar app's keys; handled once the key loop is up
+# A TERM (a --force takeover) or q from the menubar app only sets STOP: the
+# key loop sees it within a second and exits from there. Exiting inside a
+# trap hangs /bin/bash 3.2 in cleanup at the first external command it waits
+# for (a 100% CPU spin, until the takeover's KILL).
+STOP=""
+stopped() {
+  [ "$STOP" = term ] && printf '\nStopped (another forward.sh --force took over, or killed).'
+  [ "$STOP" = term ] && exit 143
+  exit 0
+}
+trap 'STOP=term' TERM
 
 # --- Sources -------------------------------------------------------------
 clips=()
@@ -198,15 +219,44 @@ output=(-c:v h264_videotoolbox -b:v "$VBITRATE" -g "$FPS" -realtime 1
         -c:a aac -b:a "$ABITRATE" -ar 48000 -ac 2
         -f mpegts "udp://${PI_HOST}:${PORT}?pkt_size=1316")
 
+# The preview taps the finished picture ([v], what the Pi gets) with split
+# into a second output: JPEGs, each written to a temp file and renamed over
+# preview.jpg, so the app never reads half a frame.
+vtail="null[v]"
+preview_out=()
+if [ "$PREVIEW" = 1 ]; then
+  vtail="split=2[v][pv];[pv]fps=${PREVIEW_FPS},scale=${PREVIEW_WIDTH}:-2[pvo]"
+  preview_out=(-map '[pvo]' -c:v mjpeg -q:v 5 -f image2 -update 1
+               -atomic_writing 1 "$LOCK/preview.jpg")
+fi
+
+# One key=value a line, renamed into place: video (live, fallback, clip,
+# clips-only), clip (the file on), mic (live, clip), sync (0, 1), host,
+# controls (what the keys can switch: none, mic, all) and clips (the
+# one-shot clips' names, | between).
+write_status() {   # video clip mic sync
+  [ "$PREVIEW" = 1 ] || return 0
+  local names="" c controls=all
+  for c in ${clips[@]+"${clips[@]}"}; do names="${names:+$names|}$(basename "$c")"; done
+  [ ! -f "$FALLBACK" ] && controls=none
+  [ "$CLIPS_ONLY" = 1 ] && controls=mic
+  printf 'video=%s\nclip=%s\nmic=%s\nsync=%s\nhost=%s\ncontrols=%s\nclips=%s\n' \
+    "$1" "$2" "$3" "$4" "$PI_HOST" "$controls" "$names" >"$LOCK/status.tmp" &&
+    mv -f "$LOCK/status.tmp" "$LOCK/status"
+  return 0
+}
+
 if [ ! -f "$FALLBACK" ]; then
   echo "No fallback clip at $FALLBACK; streaming the camera only. Press Ctrl-C to stop."
   echo
+  write_status live "" live 0
   # In the background so a TERM (a --force takeover) runs cleanup at once.
   ffmpeg -hide_banner -loglevel info -nostdin "${camera[@]}" \
-    -map 0:v -vf "$fit" -map 0:a "${output[@]}" &
+    -filter_complex "[0:v]${fit},${vtail}" \
+    -map '[v]' -map 0:a "${output[@]}" ${preview_out[@]+"${preview_out[@]}"} &
   FFMPEG=$!
   echo "$FFMPEG" >"$LOCK/children"
-  wait "$FFMPEG" || exit $?
+  wait "$FFMPEG" || { rc=$?; [ -n "$STOP" ] && stopped; exit "$rc"; }   # a TERM cuts it short
   exit 0
 fi
 
@@ -247,16 +297,17 @@ clip_in=(-f rawvideo -pix_fmt yuv420p -video_size "${OUT_WIDTH}x${OUT_HEIGHT}"
 audio_graph="[0:a]${afit},asetpts=PTS-STARTPTS[mic];[2:a]${afit},asetpts=PTS-STARTPTS[clipa];
              [mic][clipa]astreamselect=inputs=2:map=${amap},aresample=async=1[a]"
 if [ "$CLIPS_ONLY" = 1 ]; then   # input 0 is the mic alone: no camera to select
-  graph="[1:v]setpts=PTS-STARTPTS,${fit},fps=${FPS}[v];${audio_graph}"
+  graph="[1:v]setpts=PTS-STARTPTS,${fit},fps=${FPS},${vtail};${audio_graph}"
 else
   graph="[0:v]setpts=PTS-STARTPTS,${fit}[cam];[1:v]setpts=PTS-STARTPTS,${fit}[clip];
-         [cam][clip]streamselect=inputs=2:map=${map},fps=${FPS}[v];${audio_graph}"
+         [cam][clip]streamselect=inputs=2:map=${map},fps=${FPS},${vtail};${audio_graph}"
 fi
 
 ffmpeg -hide_banner -loglevel warning -nostats "${camera[@]}" \
   "${clip_in[@]}" \
   -filter_complex "$graph" \
-  -map '[v]' -map '[a]' "${output[@]}" <"$TMP/cmd" 2>"$LOG" &
+  -map '[v]' -map '[a]' "${output[@]}" ${preview_out[@]+"${preview_out[@]}"} \
+  <"$TMP/cmd" 2>"$LOG" &
 FFMPEG=$!
 echo "$FFMPEG $FEEDER" >"$LOCK/children"
 exec 3>"$TMP/cmd"   # hold the FIFO open, or ffmpeg sees EOF
@@ -273,23 +324,31 @@ esac
 keys="$keys  [m] mic  [s] sync  [q] quit"
 shown=""
 status() {
-  local playing video mic sync=""
+  local playing video mic sync="" pv pclip="" pmic=live
   playing="$(cat "$TMP/state" 2>/dev/null || true)"
   if [ "$map" = 0 ]; then
     video=$'\033[1;32m● LIVE\033[0m camera'
+    pv=live
   elif [ "${playing#clip }" != "$playing" ]; then
-    video="$(printf '\033[1;35m▶ CLIP %s\033[0m %s' \
-      "${playing#clip }" "$(basename "${clips[${playing#clip }-1]}")")"
+    pclip="$(basename "${clips[${playing#clip }-1]}")"
+    video="$(printf '\033[1;35m▶ CLIP %s\033[0m %s' "${playing#clip }" "$pclip")"
+    pv=clip
   elif [ "$CLIPS_ONLY" = 1 ]; then
-    video="$(printf '\033[1;33m● CLIPS ONLY\033[0m %s' "$(basename "$FALLBACK")")"
+    pclip="$(basename "$FALLBACK")"
+    video="$(printf '\033[1;33m● CLIPS ONLY\033[0m %s' "$pclip")"
+    pv=clips-only
   else
-    video="$(printf '\033[1;33m● FALLBACK\033[0m %s' "$(basename "$FALLBACK")")"
+    pclip="$(basename "$FALLBACK")"
+    video="$(printf '\033[1;33m● FALLBACK\033[0m %s' "$pclip")"
+    pv=fallback
   fi
   if [ "$amap" = 0 ]; then
     mic=$'\033[1;32m🎤 live mic\033[0m'
   else
     mic=$'\033[1;33m🔊 clip audio\033[0m'
+    pmic=clip
   fi
+  write_status "$pv" "$pclip" "$pmic" "$SYNC"
   [ "$SYNC" = 1 ] && sync=$'  \033[1;36m🔗 synced\033[0m'
   printf '\r\033[K%s   %s%s' "$video" "$mic" "$sync"
   shown="$map $amap $SYNC $playing"
@@ -335,22 +394,37 @@ echo "$keys"
 echo
 printf '\033[?7l'   # no line wrap while the status line is up: a narrow
                     # window cuts it off instead of starting a new line
-status
-while kill -0 "$FFMPEG" 2>/dev/null; do
-  key=""
-  IFS= read -rsn1 -t 1 key || true   # IFS= or a space reads as nothing
-  case "$key" in
+handle_key() {
+  case "$1" in
     f|F) select_source 1 ;;
     l|L) select_source 0 ;;
     " ") select_source $((1 - map)) ;;
     m|M) SYNC=0; select_audio $((1 - amap)); status ;;
     s|S) if [ "$SYNC" = 1 ]; then SYNC=0; else SYNC=1; select_audio "$map"; fi; status ;;
-    [1-9]) play_clip "$key" ;;
-    q|Q) exit 0 ;;
+    [1-9]) play_clip "$1" ;;
+    q|Q) STOP=quit ;;
   esac
+}
+
+# Keys from the menubar app. Renaming the file first means a request the app
+# appends meanwhile lands in a new file, for the next USR1.
+app_keys() {
+  local k
+  mv -f "$LOCK/requests" "$LOCK/requests.taken" 2>/dev/null || return 0
+  while IFS= read -r k; do handle_key "$k"; done <"$LOCK/requests.taken"
+  rm -f "$LOCK/requests.taken"
+}
+trap app_keys USR1
+
+status
+while [ -z "$STOP" ] && kill -0 "$FFMPEG" 2>/dev/null; do
+  key=""
+  IFS= read -rsn1 -t 1 key || true   # IFS= or a space reads as nothing
+  handle_key "$key"
   # A clip ending changes the state file; keep the status line in step.
   [ "$shown" != "$map $amap $SYNC $(cat "$TMP/state" 2>/dev/null)" ] && status
 done
+[ -n "$STOP" ] && stopped
 
 printf '\n'
 echo "ffmpeg exited:" >&2
